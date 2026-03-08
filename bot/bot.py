@@ -9,6 +9,7 @@ from bot.config import BOT_TOKEN, ROOT_ID
 from bot.whisper_client import WhisperUnavailableError, whisper_client
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def _authorized(update: Update) -> bool:
