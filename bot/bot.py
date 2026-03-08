@@ -5,7 +5,7 @@ import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
-from bot.config import BOT_TOKEN, ROOT_ID
+from bot.config import BOT_TOKEN, LOCAL_API_URL, ROOT_ID
 from bot.whisper_client import WhisperUnavailableError, whisper_client
 
 logger = logging.getLogger(__name__)
@@ -35,9 +35,14 @@ async def handle_voice(update: Update, context) -> None:
     elif message.video_note:
         file = await context.bot.get_file(message.video_note.file_id)
         fmt = "mp4"
-    else:
+    elif message.video:
         file = await context.bot.get_file(message.video.file_id)
         fmt = "mp4"
+    else:
+        # Video sent as a document (without compression)
+        doc = message.document
+        file = await context.bot.get_file(doc.file_id)
+        fmt = doc.file_name.rsplit(".", 1)[-1].lower() if doc.file_name else "mp4"
 
     status = await message.reply_text("⏳ Транскрибирую...")
 
@@ -56,10 +61,17 @@ async def handle_voice(update: Update, context) -> None:
 
 
 def main() -> None:
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if LOCAL_API_URL:
+        builder = builder.base_url(f"{LOCAL_API_URL}/bot").local_mode(True)
+        logger.info("Using local Telegram Bot API server: %s", LOCAL_API_URL)
+    app = builder.build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(
-        MessageHandler(filters.VOICE | filters.VIDEO_NOTE | filters.VIDEO, handle_voice)
+        MessageHandler(
+            filters.VOICE | filters.VIDEO_NOTE | filters.VIDEO | filters.Document.VIDEO,
+            handle_voice,
+        )
     )
     logger.info("Bot started")
     app.run_polling()
