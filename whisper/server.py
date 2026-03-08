@@ -13,22 +13,17 @@ logger = logging.getLogger(__name__)
 
 class TranscriptionServicer(whisper_pb2_grpc.TranscriptionServiceServicer):
     def __init__(self):
-        self._model = None
+        from faster_whisper import WhisperModel
 
-    def _load_model(self):
-        if self._model is None:
-            from faster_whisper import WhisperModel
-
-            model_size = os.getenv("WHISPER_MODEL", "base")
-            logger.info(f"Loading Whisper model '{model_size}'...")
-            self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
-            logger.info("Whisper model loaded.")
-        return self._model
+        model_size = os.getenv("WHISPER_MODEL", "base")
+        logger.info(f"Loading Whisper model '{model_size}'...")
+        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        logger.info("Whisper model loaded.")
 
     def Transcribe(self, request, context):
         tmp_path = None
         try:
-            model = self._load_model()
+            model = self._model
             with tempfile.NamedTemporaryFile(
                 suffix=f".{request.format}", delete=False
             ) as tmp:
