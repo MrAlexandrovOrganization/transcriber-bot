@@ -20,6 +20,14 @@ restart:
 deploy:
 	$(DOCKER_COMPOSE) up -d --build --no-cache
 
+.PHONY: test
+test:
+	cd bot && go test ./...
+
+.PHONY: cover
+cover:
+	cd bot && go test -coverprofile=/tmp/cover.out ./... && go tool cover -func=/tmp/cover.out | grep -v '/gen/'
+
 # Regenerate Go gRPC stubs locally (Docker build does this automatically).
 # Requires: protoc, protoc-gen-go, protoc-gen-go-grpc
 # Install: go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
