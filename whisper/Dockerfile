@@ -9,8 +9,7 @@ RUN python -m grpc_tools.protoc \
         -I proto \
         --python_out=proto \
         --grpc_python_out=proto \
-        proto/whisper.proto && \
-    sed -i 's/^import whisper_pb2/from proto import whisper_pb2/' proto/whisper_pb2_grpc.py
+        proto/whisper.proto
 
 
 FROM python:3.11-slim

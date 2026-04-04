@@ -60,6 +60,8 @@ async def log_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _authorized(update):
         return
+    if update.message is None:
+        return
     await update.message.reply_text(
         "Привет! Пересылай мне голосовые сообщения, кружочки или видео — я расшифрую их в текст."
     )
@@ -70,6 +72,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     message = update.effective_message
+    if message is None:
+        return
     logger.info(
         "handle_voice triggered: voice=%s video_note=%s video=%s document=%s",
         bool(message.voice),
@@ -79,6 +83,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     status = await message.reply_text("⏳ Транскрибирую...")
 
+    file = None
+    fmt = None
     try:
         if message.voice:
             file = await context.bot.get_file(message.voice.file_id)
@@ -93,10 +99,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             # Video sent as a document (without compression)
             doc = message.document
-            logger.info("Downloading document file_id=%s mime_type=%s", doc.file_id, doc.mime_type)
-            file = await context.bot.get_file(doc.file_id)
-            fmt = doc.file_name.rsplit(".", 1)[-1].lower() if doc.file_name else "mp4"
+            if doc != None:
+                logger.info("Downloading document file_id=%s mime_type=%s", doc.file_id, doc.mime_type)
+                file = await context.bot.get_file(doc.file_id)
+                fmt = doc.file_name.rsplit(".", 1)[-1].lower() if doc.file_name else "mp4"
 
+        if file is None or fmt is None:
+            return
         logger.info("File fetched, downloading audio data...")
         audio_data = await file.download_as_bytearray()
         logger.info("Downloaded %d bytes, sending to whisper...", len(audio_data))

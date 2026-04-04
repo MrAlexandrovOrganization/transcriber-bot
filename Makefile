@@ -33,4 +33,3 @@ restart:
 .phony: proto
 proto:
 	poetry run python -m grpc_tools.protoc -I proto --python_out=proto --grpc_python_out=proto proto/whisper.proto
-	sed -i.bak 's/^import whisper_pb2/from proto import whisper_pb2/' proto/whisper_pb2_grpc.py && rm -f proto/whisper_pb2_grpc.py.bak
