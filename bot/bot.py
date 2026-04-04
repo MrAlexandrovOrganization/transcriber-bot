@@ -99,7 +99,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         else:
             # Video sent as a document (without compression)
             doc = message.document
-            if doc != None:
+            if doc is not None:
                 logger.info("Downloading document file_id=%s mime_type=%s", doc.file_id, doc.mime_type)
                 file = await context.bot.get_file(doc.file_id)
                 fmt = doc.file_name.rsplit(".", 1)[-1].lower() if doc.file_name else "mp4"

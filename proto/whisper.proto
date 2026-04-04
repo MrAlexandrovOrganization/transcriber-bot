@@ -1,13 +1,21 @@
 syntax = "proto3";
 package whisper;
 
+option go_package = "transcriber-bot/gen/whisper";
+
 service TranscriptionService {
-  rpc Transcribe(TranscribeRequest) returns (TranscribeResponse);
+  // Client streams audio chunks; server responds once with the full transcript.
+  rpc Transcribe(stream TranscribeChunk) returns (TranscribeResponse);
 }
-message TranscribeRequest {
-  bytes audio_data = 1;
-  string format    = 2; // "ogg", "mp4"
+
+// Sent by the client, one chunk at a time.
+// The first chunk MUST have a non-empty format field ("ogg", "mp4", etc.).
+// Subsequent chunks may leave format empty.
+message TranscribeChunk {
+  bytes  data   = 1;
+  string format = 2;
 }
+
 message TranscribeResponse {
   string text = 1;
 }

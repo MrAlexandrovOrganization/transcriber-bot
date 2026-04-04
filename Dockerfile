@@ -6,9 +6,9 @@ WORKDIR /proto-build
 COPY proto/ ./proto/
 
 RUN python -m grpc_tools.protoc \
-        -I proto \
-        --python_out=proto \
-        --grpc_python_out=proto \
+        -I . \
+        --python_out=. \
+        --grpc_python_out=. \
         proto/whisper.proto
 
 
