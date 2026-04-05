@@ -10,7 +10,7 @@ WHISPER_PROTO_SRC ?= ../../backends/transcriber/proto/whisper.proto
 #   macOS: brew install bufbuild/buf/buf
 .PHONY: install
 install:
-	go install github.com/bufbuild/buf/cmd/buf@v1.67.1
+	go install github.com/bufbuild/buf/cmd/buf@v1.67.0
 	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
