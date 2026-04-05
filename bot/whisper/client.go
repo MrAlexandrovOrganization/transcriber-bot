@@ -76,6 +76,18 @@ func (c *Client) Submit(r io.Reader, format string) (jobID string, queuePosition
 	return resp.JobId, int(resp.QueuePosition), nil
 }
 
+// Cancel requests cancellation of a job. Returns false if the job is already done.
+func (c *Client) Cancel(jobID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)
+	defer cancel()
+
+	resp, err := c.stub.Cancel(ctx, &pb.CancelRequest{JobId: jobID})
+	if err != nil {
+		return false, c.wrapErr(err)
+	}
+	return resp.Cancelled, nil
+}
+
 // GetStatus polls the status of a submitted job.
 func (c *Client) GetStatus(jobID string) (*JobResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)

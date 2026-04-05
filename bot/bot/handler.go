@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -29,9 +31,10 @@ var clocks = []string{
 }
 
 type Bot struct {
-	api    *tgbotapi.BotAPI
-	cfg    *config.Config
-	client *whisper.Client
+	api     *tgbotapi.BotAPI
+	cfg     *config.Config
+	client  *whisper.Client
+	cancels sync.Map // jobID → context.CancelFunc
 }
 
 func New(cfg *config.Config, wc *whisper.Client) (*Bot, error) {
@@ -55,7 +58,11 @@ func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	for update := range b.api.GetUpdatesChan(u) {
-		go b.handle(update)
+		if update.CallbackQuery != nil {
+			go b.handleCallback(update.CallbackQuery)
+		} else {
+			go b.handle(update)
+		}
 	}
 }
 
@@ -118,13 +125,37 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	if queuePos > 1 {
 		statusText = fmt.Sprintf("⏳ В очереди (позиция %d), подожди немного...", queuePos)
 	}
-	statusMsg := b.replyTo(msg, statusText)
 
-	go b.pollAndUpdate(msg, statusMsg.MessageID, jobID)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.cancels.Store(jobID, cancel)
+
+	keyboard := tgbotapi.NewInlineKeyboardMarkup(
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("❌ Отменить", "cancel:"+jobID),
+		),
+	)
+	m := tgbotapi.NewMessage(msg.Chat.ID, statusText)
+	m.ReplyToMessageID = msg.MessageID
+	m.ReplyMarkup = keyboard
+	statusMsg, err := b.api.Send(m)
+	if err != nil {
+		slog.Error("send status message", "error", err)
+		cancel()
+		b.cancels.Delete(jobID)
+		return
+	}
+	slog.Info("replied", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
+
+	go b.pollAndUpdate(ctx, cancel, msg, statusMsg.MessageID, jobID)
 }
 
 // pollAndUpdate periodically polls the job status and edits the status message when done.
-func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID string) {
+func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *tgbotapi.Message, statusMsgID int, jobID string) {
+	defer func() {
+		cancel()
+		b.cancels.Delete(jobID)
+	}()
+
 	slog.Info("polling started", "job_id", jobID, "status_msg_id", statusMsgID)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
@@ -133,11 +164,18 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 
 	for {
 		select {
+		case <-ctx.Done():
+			slog.Info("job cancelled", "job_id", jobID)
+			b.editFinal(origMsg.Chat.ID, statusMsgID, "❌ Отменено.")
+			return
 		case <-deadline:
 			slog.Warn("poll deadline exceeded", "job_id", jobID)
-			b.edit(origMsg.Chat.ID, statusMsgID, "Превышено время ожидания (3 часа). Попробуй ещё раз.")
+			b.editFinal(origMsg.Chat.ID, statusMsgID, "Превышено время ожидания (3 часа). Попробуй ещё раз.")
 			return
 		case <-ticker.C:
+			if ctx.Err() != nil {
+				return
+			}
 			result, err := b.client.GetStatus(jobID)
 			if err != nil {
 				slog.Warn("poll status", "job_id", jobID, "error", err)
@@ -151,10 +189,8 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 			switch result.Status {
 			case pb.JobStatus_PENDING:
 				b.edit(origMsg.Chat.ID, statusMsgID, clock+" В очереди...")
-				continue
 			case pb.JobStatus_RUNNING:
 				b.edit(origMsg.Chat.ID, statusMsgID, clock+" Расшифровываю...")
-				continue
 			case pb.JobStatus_DONE:
 				text := result.Text
 				if text == "" {
@@ -162,17 +198,46 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 				}
 				parts := splitText(text)
 				slog.Info("job done", "job_id", jobID, "text_runes", len([]rune(text)), "parts", len(parts))
-				b.edit(origMsg.Chat.ID, statusMsgID, parts[0])
+				b.editFinal(origMsg.Chat.ID, statusMsgID, parts[0])
 				for _, part := range parts[1:] {
 					b.replyTo(origMsg, part)
 				}
 				return
 			case pb.JobStatus_FAILED:
+				if result.Error == "cancelled" {
+					return // already handled via ctx.Done()
+				}
 				slog.Error("job failed", "job_id", jobID, "error", result.Error)
-				b.edit(origMsg.Chat.ID, statusMsgID, "Произошла ошибка при расшифровке.")
+				b.editFinal(origMsg.Chat.ID, statusMsgID, "Произошла ошибка при расшифровке.")
 				return
 			}
 		}
+	}
+}
+
+// handleCallback processes inline keyboard button presses.
+func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
+	if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
+		slog.Warn("answer callback", "error", err)
+	}
+
+	if !strings.HasPrefix(cb.Data, "cancel:") {
+		return
+	}
+	jobID := strings.TrimPrefix(cb.Data, "cancel:")
+	slog.Info("cancel requested", "job_id", jobID)
+
+	val, ok := b.cancels.LoadAndDelete(jobID)
+	if !ok {
+		slog.Warn("cancel: job not found or already finished", "job_id", jobID)
+		return
+	}
+	val.(context.CancelFunc)()
+
+	if cancelled, err := b.client.Cancel(jobID); err != nil {
+		slog.Warn("cancel job on backend", "job_id", jobID, "error", err)
+	} else {
+		slog.Info("cancel sent to backend", "job_id", jobID, "cancelled", cancelled)
 	}
 }
 
@@ -240,6 +305,18 @@ func (b *Bot) edit(chatID int64, msgID int, text string) {
 	slog.Info("editing message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
 	if _, err := b.api.Send(tgbotapi.NewEditMessageText(chatID, msgID, text)); err != nil {
 		slog.Error("edit message failed", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes, "error", err)
+	}
+}
+
+// editFinal edits the message text and removes the inline keyboard.
+func (b *Bot) editFinal(chatID int64, msgID int, text string) {
+	textRunes := len([]rune(text))
+	slog.Info("editing final message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
+	cfg := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	empty := tgbotapi.NewInlineKeyboardMarkup()
+	cfg.ReplyMarkup = &empty
+	if _, err := b.api.Send(cfg); err != nil {
+		slog.Error("edit final message failed", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes, "error", err)
 	}
 }
 

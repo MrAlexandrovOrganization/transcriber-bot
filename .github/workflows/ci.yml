@@ -18,14 +18,14 @@ jobs:
         with:
           go-version: "1.26.1"
 
-      - name: Install protoc
-        run: sudo apt-get install -y protobuf-compiler
-
-      - name: Install dependencies
+      - name: Install tools
         run: make install
 
+      - name: Lint proto
+        run: make proto-lint
+
       - name: Generate proto stubs
-        run: make proto
+        run: buf generate
 
       - name: Lint
         run: make format
