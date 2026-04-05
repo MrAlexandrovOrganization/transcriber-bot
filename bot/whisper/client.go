@@ -3,6 +3,7 @@ package whisper
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"google.golang.org/grpc"
@@ -55,7 +56,7 @@ func (c *Client) Close() error {
 
 // Submit uploads audio and returns a job ID immediately.
 // queuePosition indicates where in the queue this job is (1 = will run next).
-func (c *Client) Submit(audioData []byte, format string) (jobID string, queuePosition int, err error) {
+func (c *Client) Submit(r io.Reader, format string) (jobID string, queuePosition int, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 
@@ -64,7 +65,7 @@ func (c *Client) Submit(audioData []byte, format string) (jobID string, queuePos
 		return "", 0, c.wrapErr(err)
 	}
 
-	if err := c.sendChunks(stream, audioData, format); err != nil {
+	if err := c.sendChunks(stream, r, format); err != nil {
 		return "", 0, err
 	}
 
@@ -94,15 +95,26 @@ func (c *Client) GetStatus(jobID string) (*JobResult, error) {
 // sendChunks sends audio data over a client-streaming RPC.
 func (c *Client) sendChunks(stream interface {
 	Send(*pb.TranscribeChunk) error
-}, audioData []byte, format string) error {
-	for i := 0; i < len(audioData); i += chunkSize {
-		end := min(i+chunkSize, len(audioData))
-		chunk := &pb.TranscribeChunk{Data: audioData[i:end]}
-		if i == 0 {
-			chunk.Format = format
+}, r io.Reader, format string) error {
+	buf := make([]byte, chunkSize)
+	first := true
+	for {
+		n, err := r.Read(buf)
+		if n > 0 {
+			chunk := &pb.TranscribeChunk{Data: buf[:n]}
+			if first {
+				chunk.Format = format
+				first = false
+			}
+			if sendErr := stream.Send(chunk); sendErr != nil {
+				return c.wrapErr(sendErr)
+			}
 		}
-		if err := stream.Send(chunk); err != nil {
-			return c.wrapErr(err)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("read chunk: %w", err)
 		}
 	}
 	return nil

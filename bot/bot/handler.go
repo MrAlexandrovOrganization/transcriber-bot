@@ -85,14 +85,15 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		return
 	}
 
-	data, err := b.downloadFile(fileID)
+	rc, err := b.downloadFile(fileID)
 	if err != nil {
 		slog.Error("download file", "error", err)
 		b.replyTo(msg, "Не удалось скачать файл.")
 		return
 	}
+	defer rc.Close()
 
-	jobID, queuePos, err := b.client.Submit(data, format)
+	jobID, queuePos, err := b.client.Submit(rc, format)
 	if err != nil {
 		var unavail *whisper.UnavailableError
 		if errors.As(err, &unavail) {
@@ -165,7 +166,7 @@ func extractFile(msg *tgbotapi.Message) (fileID, format string) {
 	return "", ""
 }
 
-func (b *Bot) downloadFile(fileID string) ([]byte, error) {
+func (b *Bot) downloadFile(fileID string) (io.ReadCloser, error) {
 	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		return nil, fmt.Errorf("get file info: %w", err)
@@ -173,11 +174,11 @@ func (b *Bot) downloadFile(fileID string) ([]byte, error) {
 
 	if b.cfg.LocalAPIURL != "" {
 		slog.Info("reading local file", "path", file.FilePath)
-		data, err := os.ReadFile(file.FilePath)
+		f, err := os.Open(file.FilePath)
 		if err != nil {
-			return nil, fmt.Errorf("read local file: %w", err)
+			return nil, fmt.Errorf("open local file: %w", err)
 		}
-		return data, nil
+		return f, nil
 	}
 
 	fileURL := file.Link(b.cfg.BotToken)
@@ -186,17 +187,12 @@ func (b *Bot) downloadFile(fileID string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		return nil, fmt.Errorf("download failed: status %d, body: %s", resp.StatusCode, body)
 	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read body: %w", err)
-	}
-	slog.Info("got audio", "bytes", len(data))
-	return data, nil
+	return resp.Body, nil
 }
 
 func (b *Bot) replyTo(orig *tgbotapi.Message, text string) tgbotapi.Message {
