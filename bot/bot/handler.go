@@ -20,7 +20,7 @@ import (
 const (
 	pollInterval = 5 * time.Second
 	pollDeadline = 3 * time.Hour
-	maxMsgRunes  = 4096 // Telegram message length limit
+	maxMsgRunes  = 4096 - 128 // Telegram message length limit
 )
 
 type Bot struct {
@@ -235,10 +235,7 @@ func splitText(text string) []string {
 	}
 	var parts []string
 	for len(runes) > 0 {
-		end := maxMsgRunes
-		if end > len(runes) {
-			end = len(runes)
-		}
+		end := min(maxMsgRunes, len(runes))
 		parts = append(parts, string(runes[:end]))
 		runes = runes[end:]
 	}
