@@ -18,15 +18,14 @@ import (
 )
 
 const (
-	pollInterval = 5 * time.Second
+	pollInterval = 300 * time.Millisecond
 	pollDeadline = 3 * time.Hour
 	maxMsgRunes  = 4096 - 128 // Telegram message length limit
 )
 
+// All clocks: 🕐🕜🕑🕝🕒🕞🕓🕟🕔🕠🕕🕡🕖🕢🕗🕣🕘🕤🕙🕥🕚🕦🕛🕧
 var clocks = []string{
-	"🕐", "🕜", "🕑", "🕝", "🕒", "🕞", "🕓", "🕟",
-	"🕔", "🕠", "🕕", "🕡", "🕖", "🕢", "🕗", "🕣",
-	"🕘", "🕤", "🕙", "🕥", "🕚", "🕦", "🕛", "🕧",
+	"🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛",
 }
 
 type Bot struct {
@@ -144,7 +143,9 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 				slog.Warn("poll status", "job_id", jobID, "error", err)
 				continue
 			}
-			slog.Info("poll status", "job_id", jobID, "status", result.Status)
+			if tick%10 == 0 {
+				slog.Info("poll status", "job_id", jobID, "status", result.Status)
+			}
 			clock := clocks[tick%len(clocks)]
 			tick++
 			switch result.Status {
