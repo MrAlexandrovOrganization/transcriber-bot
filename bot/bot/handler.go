@@ -23,6 +23,12 @@ const (
 	maxMsgRunes  = 4096 - 128 // Telegram message length limit
 )
 
+var clocks = []string{
+	"🕐", "🕜", "🕑", "🕝", "🕒", "🕞", "🕓", "🕟",
+	"🕔", "🕠", "🕕", "🕡", "🕖", "🕢", "🕗", "🕣",
+	"🕘", "🕤", "🕙", "🕥", "🕚", "🕦", "🕛", "🕧",
+}
+
 type Bot struct {
 	api    *tgbotapi.BotAPI
 	cfg    *config.Config
@@ -124,6 +130,7 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	deadline := time.After(pollDeadline)
+	tick := 0
 
 	for {
 		select {
@@ -138,7 +145,15 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 				continue
 			}
 			slog.Info("poll status", "job_id", jobID, "status", result.Status)
+			clock := clocks[tick%len(clocks)]
+			tick++
 			switch result.Status {
+			case pb.JobStatus_PENDING:
+				b.edit(origMsg.Chat.ID, statusMsgID, clock+" В очереди...")
+				continue
+			case pb.JobStatus_RUNNING:
+				b.edit(origMsg.Chat.ID, statusMsgID, clock+" Расшифровываю...")
+				continue
 			case pb.JobStatus_DONE:
 				text := result.Text
 				if text == "" {
