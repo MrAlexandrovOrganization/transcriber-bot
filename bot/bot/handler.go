@@ -20,6 +20,7 @@ import (
 const (
 	pollInterval = 5 * time.Second
 	pollDeadline = 3 * time.Hour
+	maxMsgRunes  = 4096 // Telegram message length limit
 )
 
 type Bot struct {
@@ -84,6 +85,7 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	if fileID == "" {
 		return
 	}
+	slog.Info("file received", "file_id", fileID, "format", format)
 
 	rc, err := b.downloadFile(fileID)
 	if err != nil {
@@ -105,6 +107,8 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		return
 	}
 
+	slog.Info("job submitted", "job_id", jobID, "queue_pos", queuePos)
+
 	statusText := "⏳ Расшифровываю..."
 	if queuePos > 1 {
 		statusText = fmt.Sprintf("⏳ В очереди (позиция %d), подожди немного...", queuePos)
@@ -116,6 +120,7 @@ func (b *Bot) handle(update tgbotapi.Update) {
 
 // pollAndUpdate periodically polls the job status and edits the status message when done.
 func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID string) {
+	slog.Info("polling started", "job_id", jobID, "status_msg_id", statusMsgID)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	deadline := time.After(pollDeadline)
@@ -123,6 +128,7 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 	for {
 		select {
 		case <-deadline:
+			slog.Warn("poll deadline exceeded", "job_id", jobID)
 			b.edit(origMsg.Chat.ID, statusMsgID, "Превышено время ожидания (3 часа). Попробуй ещё раз.")
 			return
 		case <-ticker.C:
@@ -131,13 +137,19 @@ func (b *Bot) pollAndUpdate(origMsg *tgbotapi.Message, statusMsgID int, jobID st
 				slog.Warn("poll status", "job_id", jobID, "error", err)
 				continue
 			}
+			slog.Info("poll status", "job_id", jobID, "status", result.Status)
 			switch result.Status {
 			case pb.JobStatus_DONE:
 				text := result.Text
 				if text == "" {
 					text = "(тишина)"
 				}
-				b.edit(origMsg.Chat.ID, statusMsgID, text)
+				parts := splitText(text)
+				slog.Info("job done", "job_id", jobID, "text_runes", len([]rune(text)), "parts", len(parts))
+				b.edit(origMsg.Chat.ID, statusMsgID, parts[0])
+				for _, part := range parts[1:] {
+					b.replyTo(origMsg, part)
+				}
 				return
 			case pb.JobStatus_FAILED:
 				slog.Error("job failed", "job_id", jobID, "error", result.Error)
@@ -200,13 +212,35 @@ func (b *Bot) replyTo(orig *tgbotapi.Message, text string) tgbotapi.Message {
 	m.ReplyToMessageID = orig.MessageID
 	sent, err := b.api.Send(m)
 	if err != nil {
-		slog.Error("reply", "error", err)
+		slog.Error("reply failed", "chat_id", orig.Chat.ID, "text_runes", len([]rune(text)), "error", err)
+	} else {
+		slog.Info("replied", "chat_id", orig.Chat.ID, "msg_id", sent.MessageID)
 	}
 	return sent
 }
 
 func (b *Bot) edit(chatID int64, msgID int, text string) {
+	textRunes := len([]rune(text))
+	slog.Info("editing message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
 	if _, err := b.api.Send(tgbotapi.NewEditMessageText(chatID, msgID, text)); err != nil {
-		slog.Error("edit message", "error", err)
+		slog.Error("edit message failed", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes, "error", err)
 	}
+}
+
+// splitText splits text into chunks that fit within Telegram's message length limit.
+func splitText(text string) []string {
+	runes := []rune(text)
+	if len(runes) <= maxMsgRunes {
+		return []string{text}
+	}
+	var parts []string
+	for len(runes) > 0 {
+		end := maxMsgRunes
+		if end > len(runes) {
+			end = len(runes)
+		}
+		parts = append(parts, string(runes[:end]))
+		runes = runes[end:]
+	}
+	return parts
 }
