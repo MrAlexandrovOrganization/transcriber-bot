@@ -25,11 +25,6 @@ const (
 	maxMsgRunes  = 4096 - 128 // Telegram message length limit
 )
 
-// All clocks: 🕐🕜🕑🕝🕒🕞🕓🕟🕔🕠🕕🕡🕖🕢🕗🕣🕘🕤🕙🕥🕚🕦🕛🕧
-// var clocks = []string{
-// 	"🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛",
-// }
-
 type Bot struct {
 	api     *tgbotapi.BotAPI
 	cfg     *config.Config
@@ -163,7 +158,6 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	deadline := time.After(pollDeadline)
-	// tick := 0
 
 	keyboard := cancelKeyboard(jobID)
 
@@ -187,16 +181,12 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 				continue
 			}
 			slog.Info("poll status", "job_id", jobID, "status", result.Status)
-			// if tick%10 == 0 {
-			// 	slog.Info("poll status", "job_id", jobID, "status", result.Status)
-			// }
-			// clock := clocks[tick%len(clocks)]
-			// tick++
+
 			switch result.Status {
 			case pb.JobStatus_PENDING:
-				b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, " В очереди...", keyboard)
+				b.edit(origMsg.Chat.ID, statusMsgID, " В очереди...", keyboard)
 			case pb.JobStatus_RUNNING:
-				b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, " Расшифровываю...", keyboard)
+				b.edit(origMsg.Chat.ID, statusMsgID, " Расшифровываю...", keyboard)
 			case pb.JobStatus_DONE:
 				text := result.Text
 				if text == "" {
