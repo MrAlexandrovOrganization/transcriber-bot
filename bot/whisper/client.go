@@ -27,11 +27,19 @@ func (e *UnavailableError) Error() string {
 	return fmt.Sprintf("whisper service unavailable: %v", e.cause)
 }
 
+// Segment holds timing and text for a single transcribed segment.
+type Segment struct {
+	Start float32
+	End   float32
+	Text  string
+}
+
 // JobResult holds the outcome of an async transcription job.
 type JobResult struct {
-	Status pb.JobStatus
-	Text   string
-	Error  string
+	Status   pb.JobStatus
+	Text     string
+	Error    string
+	Segments []Segment
 }
 
 type Client struct {
@@ -56,7 +64,8 @@ func (c *Client) Close() error {
 
 // Submit uploads audio and returns a job ID immediately.
 // queuePosition indicates where in the queue this job is (1 = will run next).
-func (c *Client) Submit(r io.Reader, format string) (jobID string, queuePosition int, err error) {
+// options may be nil to use server defaults.
+func (c *Client) Submit(r io.Reader, format string, options *pb.TranscriptionOptions) (jobID string, queuePosition int, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 	defer cancel()
 
@@ -65,7 +74,7 @@ func (c *Client) Submit(r io.Reader, format string) (jobID string, queuePosition
 		return "", 0, c.wrapErr(err)
 	}
 
-	if err := c.sendChunks(stream, r, format); err != nil {
+	if err := c.sendChunks(stream, r, format, options); err != nil {
 		return "", 0, err
 	}
 
@@ -97,17 +106,24 @@ func (c *Client) GetStatus(jobID string) (*JobResult, error) {
 	if err != nil {
 		return nil, c.wrapErr(err)
 	}
+
+	segs := make([]Segment, len(resp.Segments))
+	for i, s := range resp.Segments {
+		segs[i] = Segment{Start: s.Start, End: s.End, Text: s.Text}
+	}
+
 	return &JobResult{
-		Status: resp.Status,
-		Text:   resp.Text,
-		Error:  resp.Error,
+		Status:   resp.Status,
+		Text:     resp.Text,
+		Error:    resp.Error,
+		Segments: segs,
 	}, nil
 }
 
 // sendChunks sends audio data over a client-streaming RPC.
 func (c *Client) sendChunks(stream interface {
 	Send(*pb.TranscribeChunk) error
-}, r io.Reader, format string) error {
+}, r io.Reader, format string, options *pb.TranscriptionOptions) error {
 	buf := make([]byte, chunkSize)
 	first := true
 	for {
@@ -116,6 +132,7 @@ func (c *Client) sendChunks(stream interface {
 			chunk := &pb.TranscribeChunk{Data: buf[:n]}
 			if first {
 				chunk.Format = format
+				chunk.Options = options
 				first = false
 			}
 			if sendErr := stream.Send(chunk); sendErr != nil {

@@ -34,7 +34,7 @@ func TestSendChunks_SingleChunk(t *testing.T) {
 	stream := &mockSendStream{}
 	data := []byte("hello audio")
 
-	if err := c.sendChunks(stream, bytes.NewReader(data), "ogg"); err != nil {
+	if err := c.sendChunks(stream, bytes.NewReader(data), "ogg", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(stream.chunks) != 1 {
@@ -58,7 +58,7 @@ func TestSendChunks_MultipleChunks(t *testing.T) {
 		data[i] = byte(i % 256)
 	}
 
-	if err := c.sendChunks(stream, bytes.NewReader(data), "mp4"); err != nil {
+	if err := c.sendChunks(stream, bytes.NewReader(data), "mp4", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(stream.chunks) != 2 {
@@ -85,7 +85,7 @@ func TestSendChunks_EmptyData(t *testing.T) {
 	c := newTestClient()
 	stream := &mockSendStream{}
 
-	if err := c.sendChunks(stream, bytes.NewReader([]byte{}), "ogg"); err != nil {
+	if err := c.sendChunks(stream, bytes.NewReader([]byte{}), "ogg", nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(stream.chunks) != 0 {
@@ -99,7 +99,7 @@ func TestSendChunks_SendError(t *testing.T) {
 	stream := &mockSendStream{err: sentinelErr}
 
 	data := []byte("audio data")
-	err := c.sendChunks(stream, bytes.NewReader(data), "ogg")
+	err := c.sendChunks(stream, bytes.NewReader(data), "ogg", nil)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}

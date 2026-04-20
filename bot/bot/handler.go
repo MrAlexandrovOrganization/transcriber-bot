@@ -31,10 +31,11 @@ const (
 // }
 
 type Bot struct {
-	api     *tgbotapi.BotAPI
-	cfg     *config.Config
-	client  *whisper.Client
-	cancels sync.Map // jobID → context.CancelFunc
+	api        *tgbotapi.BotAPI
+	cfg        *config.Config
+	client     *whisper.Client
+	cancels    sync.Map // jobID → context.CancelFunc
+	userPreset sync.Map // userID → preset name (string)
 }
 
 func New(cfg *config.Config, wc *whisper.Client) (*Bot, error) {
@@ -95,9 +96,7 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	}
 
 	if msg.IsCommand() {
-		if msg.Command() == "start" {
-			b.replyTo(msg, "Привет! Пересылай мне голосовые сообщения, кружочки или видео — я расшифрую их в текст.")
-		}
+		b.handleCommand(msg)
 		return
 	}
 
@@ -107,6 +106,14 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	}
 	slog.Info("file received", "file_id", fileID, "format", format)
 
+	// Determine effective preset.
+	storedPreset := ""
+	if v, ok := b.userPreset.Load(msg.From.ID); ok {
+		storedPreset = v.(string)
+	}
+	effectivePreset := resolvePreset(storedPreset, msg)
+	slog.Info("using preset", "preset", effectivePreset)
+
 	rc, err := b.downloadFile(fileID)
 	if err != nil {
 		slog.Error("download file", "error", err)
@@ -115,7 +122,8 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	}
 	defer rc.Close()
 
-	jobID, queuePos, err := b.client.Submit(rc, format)
+	opts := buildOptions(effectivePreset)
+	jobID, queuePos, err := b.client.Submit(rc, format, opts)
 	if err != nil {
 		var unavail *whisper.UnavailableError
 		if errors.As(err, &unavail) {
@@ -127,7 +135,7 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		return
 	}
 
-	slog.Info("job submitted", "job_id", jobID, "queue_pos", queuePos)
+	slog.Info("job submitted", "job_id", jobID, "queue_pos", queuePos, "preset", effectivePreset)
 
 	statusText := "⏳ Расшифровываю..."
 	if queuePos > 1 {
@@ -149,11 +157,50 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	}
 	slog.Info("replied", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
 
-	go b.pollAndUpdate(ctx, cancel, msg, statusMsg.MessageID, jobID)
+	go b.pollAndUpdate(ctx, cancel, msg, statusMsg.MessageID, jobID, effectivePreset)
+}
+
+func (b *Bot) handleCommand(msg *tgbotapi.Message) {
+	switch msg.Command() {
+	case "start":
+		b.replyTo(msg, "Привет! Отправь мне голосовое сообщение, кружочек или видео — я расшифрую их в текст.\n\nИспользуй /preset для выбора режима расшифровки.")
+	case "preset":
+		b.sendPresetKeyboard(msg)
+	}
+}
+
+func (b *Bot) sendPresetKeyboard(msg *tgbotapi.Message) {
+	currentPreset := "auto"
+	if v, ok := b.userPreset.Load(msg.From.ID); ok {
+		currentPreset = v.(string)
+	}
+
+	// Build keyboard: 2 buttons per row.
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i := 0; i < len(availablePresets); i += 2 {
+		var row []tgbotapi.InlineKeyboardButton
+		for j := i; j < i+2 && j < len(availablePresets); j++ {
+			p := availablePresets[j]
+			label := p.label
+			if p.name == currentPreset {
+				label += " ✓"
+			}
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData(label, "preset:"+p.name))
+		}
+		rows = append(rows, row)
+	}
+
+	currentLabel := presetLabels[currentPreset]
+	m := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Выбери режим расшифровки.\nТекущий: %s", currentLabel))
+	m.ReplyToMessageID = msg.MessageID
+	m.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	if _, err := b.api.Send(m); err != nil {
+		slog.Error("send preset keyboard", "error", err)
+	}
 }
 
 // pollAndUpdate periodically polls the job status and edits the status message when done.
-func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *tgbotapi.Message, statusMsgID int, jobID string) {
+func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *tgbotapi.Message, statusMsgID int, jobID, preset string) {
 	defer func() {
 		cancel()
 		b.cancels.Delete(jobID)
@@ -198,15 +245,20 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 			case pb.JobStatus_RUNNING:
 				b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, " Расшифровываю...", keyboard)
 			case pb.JobStatus_DONE:
-				text := result.Text
+				text := formatResult(result, preset)
 				if text == "" {
 					text = "(тишина)"
 				}
-				parts := splitText(text)
-				slog.Info("job done", "job_id", jobID, "text_runes", len([]rune(text)), "parts", len(parts))
-				b.editFinal(origMsg.Chat.ID, statusMsgID, parts[0])
-				for _, part := range parts[1:] {
-					b.replyTo(origMsg, part)
+				slog.Info("job done", "job_id", jobID, "text_runes", len([]rune(text)))
+				if preset == "lecture" {
+					b.editFinal(origMsg.Chat.ID, statusMsgID, "✅ Готово!")
+					b.sendAsFile(origMsg, text, origMsg.MessageID)
+				} else {
+					parts := splitText(text)
+					b.editFinal(origMsg.Chat.ID, statusMsgID, parts[0])
+					for _, part := range parts[1:] {
+						b.replyTo(origMsg, part)
+					}
 				}
 				return
 			case pb.JobStatus_FAILED:
@@ -221,15 +273,35 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 	}
 }
 
+// formatResult formats the transcription result for display.
+// For lecture preset (with segments), formats with timestamps.
+// For other presets, returns plain text.
+func formatResult(result *whisper.JobResult, preset string) string {
+	if preset == "lecture" && len(result.Segments) > 0 {
+		var sb strings.Builder
+		for _, seg := range result.Segments {
+			fmt.Fprintf(&sb, "[%.1fs → %.1fs] %s\n", seg.Start, seg.End, seg.Text)
+		}
+		return strings.TrimSpace(sb.String())
+	}
+	return result.Text
+}
+
 // handleCallback processes inline keyboard button presses.
 func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
 		slog.Warn("answer callback", "error", err)
 	}
 
-	if !strings.HasPrefix(cb.Data, "cancel:") {
-		return
+	switch {
+	case strings.HasPrefix(cb.Data, "cancel:"):
+		b.handleCancelCallback(cb)
+	case strings.HasPrefix(cb.Data, "preset:"):
+		b.handlePresetCallback(cb)
 	}
+}
+
+func (b *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 	jobID := strings.TrimPrefix(cb.Data, "cancel:")
 	slog.Info("cancel requested", "job_id", jobID)
 
@@ -244,6 +316,56 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 		slog.Warn("cancel job on backend", "job_id", jobID, "error", err)
 	} else {
 		slog.Info("cancel sent to backend", "job_id", jobID, "cancelled", cancelled)
+	}
+}
+
+func (b *Bot) handlePresetCallback(cb *tgbotapi.CallbackQuery) {
+	if cb.Message == nil || cb.From == nil {
+		return
+	}
+	presetName := strings.TrimPrefix(cb.Data, "preset:")
+
+	// Validate preset name.
+	valid := false
+	for _, p := range availablePresets {
+		if p.name == presetName {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		slog.Warn("unknown preset", "preset", presetName)
+		return
+	}
+
+	b.userPreset.Store(cb.From.ID, presetName)
+	slog.Info("preset selected", "user_id", cb.From.ID, "preset", presetName)
+
+	label := presetLabels[presetName]
+
+	// Update the keyboard to show the new selection.
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i := 0; i < len(availablePresets); i += 2 {
+		var row []tgbotapi.InlineKeyboardButton
+		for j := i; j < i+2 && j < len(availablePresets); j++ {
+			p := availablePresets[j]
+			btnLabel := p.label
+			if p.name == presetName {
+				btnLabel += " ✓"
+			}
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData(btnLabel, "preset:"+p.name))
+		}
+		rows = append(rows, row)
+	}
+
+	edit := tgbotapi.NewEditMessageTextAndMarkup(
+		cb.Message.Chat.ID,
+		cb.Message.MessageID,
+		fmt.Sprintf("Выбери режим расшифровки.\nТекущий: %s", label),
+		tgbotapi.NewInlineKeyboardMarkup(rows...),
+	)
+	if _, err := b.api.Send(edit); err != nil {
+		slog.Warn("update preset keyboard", "error", err)
 	}
 }
 
@@ -292,6 +414,20 @@ func (b *Bot) downloadFile(fileID string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("download failed: status %d, body: %s", resp.StatusCode, body)
 	}
 	return resp.Body, nil
+}
+
+func (b *Bot) sendAsFile(orig *tgbotapi.Message, text string, replyToID int) {
+	fileName := fmt.Sprintf("lecture_%d.txt", orig.MessageID)
+	doc := tgbotapi.NewDocument(orig.Chat.ID, tgbotapi.FileBytes{
+		Name:  fileName,
+		Bytes: []byte(text),
+	})
+	doc.ReplyToMessageID = replyToID
+	if _, err := b.api.Send(doc); err != nil {
+		slog.Error("send file failed", "chat_id", orig.Chat.ID, "error", err)
+	} else {
+		slog.Info("sent as file", "chat_id", orig.Chat.ID, "file", fileName)
+	}
 }
 
 func (b *Bot) replyTo(orig *tgbotapi.Message, text string) tgbotapi.Message {
