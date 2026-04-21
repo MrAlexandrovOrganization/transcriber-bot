@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	pollInterval = 300 * time.Millisecond
+	pollInterval = 5 * time.Second
 	pollDeadline = 3 * time.Hour
 	maxMsgRunes  = 4096 - 128 // Telegram message length limit
 )
@@ -114,50 +114,13 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	effectivePreset := resolvePreset(storedPreset, msg)
 	slog.Info("using preset", "preset", effectivePreset)
 
-	rc, err := b.downloadFile(fileID)
+	statusMsg, err := b.sendInitialStatus(msg)
 	if err != nil {
-		slog.Error("download file", "error", err)
-		b.replyTo(msg, "Не удалось скачать файл.")
-		return
-	}
-	defer rc.Close()
-
-	opts := buildOptions(effectivePreset)
-	jobID, queuePos, err := b.client.Submit(rc, format, opts)
-	if err != nil {
-		var unavail *whisper.UnavailableError
-		if errors.As(err, &unavail) {
-			b.replyTo(msg, "Сервис транскрипции недоступен, попробуй позже.")
-		} else {
-			slog.Error("submit job", "error", err)
-			b.replyTo(msg, "Произошла ошибка при отправке на расшифровку.")
-		}
+		slog.Error("send initial status message", "error", err)
 		return
 	}
 
-	slog.Info("job submitted", "job_id", jobID, "queue_pos", queuePos, "preset", effectivePreset)
-
-	statusText := "⏳ Расшифровываю..."
-	if queuePos > 1 {
-		statusText = fmt.Sprintf("⏳ В очереди (позиция %d), подожди немного...", queuePos)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	b.cancels.Store(jobID, cancel)
-
-	m := tgbotapi.NewMessage(msg.Chat.ID, statusText)
-	m.ReplyToMessageID = msg.MessageID
-	m.ReplyMarkup = cancelKeyboard(jobID)
-	statusMsg, err := b.api.Send(m)
-	if err != nil {
-		slog.Error("send status message", "error", err)
-		cancel()
-		b.cancels.Delete(jobID)
-		return
-	}
-	slog.Info("replied", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
-
-	go b.pollAndUpdate(ctx, cancel, msg, statusMsg.MessageID, jobID, effectivePreset)
+	go b.processFile(msg, statusMsg.MessageID, fileID, format, effectivePreset)
 }
 
 func (b *Bot) handleCommand(msg *tgbotapi.Message) {
@@ -213,6 +176,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 	// tick := 0
 
 	keyboard := cancelKeyboard(jobID)
+	lastStatusText := ""
 
 	for {
 		select {
@@ -241,9 +205,20 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 			// tick++
 			switch result.Status {
 			case pb.JobStatus_PENDING:
-				b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, " В очереди...", keyboard)
+				statusText := "⏳ В очереди..."
+				if statusText != lastStatusText {
+					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, &keyboard)
+					lastStatusText = statusText
+				}
 			case pb.JobStatus_RUNNING:
-				b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, " Расшифровываю...", keyboard)
+				statusText := "⏳ Расшифровываю..."
+				if result.ProgressPercent > 0 {
+					statusText = fmt.Sprintf("⏳ Расшифровываю... %.0f%%", result.ProgressPercent)
+				}
+				if statusText != lastStatusText {
+					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, &keyboard)
+					lastStatusText = statusText
+				}
 			case pb.JobStatus_DONE:
 				text := formatResult(result, preset)
 				if text == "" {
@@ -387,7 +362,7 @@ func extractFile(msg *tgbotapi.Message) (fileID, format string) {
 	return "", ""
 }
 
-func (b *Bot) downloadFile(fileID string) (io.ReadCloser, error) {
+func (b *Bot) downloadFile(fileID string, onProgress func(downloaded, total int64)) (io.ReadCloser, error) {
 	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		return nil, fmt.Errorf("get file info: %w", err)
@@ -398,6 +373,11 @@ func (b *Bot) downloadFile(fileID string) (io.ReadCloser, error) {
 		f, err := os.Open(file.FilePath)
 		if err != nil {
 			return nil, fmt.Errorf("open local file: %w", err)
+		}
+		if onProgress != nil {
+			if stat, statErr := f.Stat(); statErr == nil {
+				onProgress(stat.Size(), stat.Size())
+			}
 		}
 		return f, nil
 	}
@@ -413,7 +393,66 @@ func (b *Bot) downloadFile(fileID string) (io.ReadCloser, error) {
 		resp.Body.Close()
 		return nil, fmt.Errorf("download failed: status %d, body: %s", resp.StatusCode, body)
 	}
-	return resp.Body, nil
+	return newProgressReadCloser(resp.Body, resp.ContentLength, onProgress), nil
+}
+
+func (b *Bot) sendInitialStatus(msg *tgbotapi.Message) (tgbotapi.Message, error) {
+	m := tgbotapi.NewMessage(msg.Chat.ID, "⏳ Скачиваю видео...")
+	m.ReplyToMessageID = msg.MessageID
+
+	statusMsg, err := b.api.Send(m)
+	if err != nil {
+		return tgbotapi.Message{}, err
+	}
+
+	slog.Info("sent initial status", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
+	return statusMsg, nil
+}
+
+func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format, preset string) {
+	lastDownloadStatus := ""
+	rc, err := b.downloadFile(fileID, func(downloaded, total int64) {
+		statusText := formatDownloadStatus(downloaded, total)
+		if statusText == lastDownloadStatus {
+			return
+		}
+		b.edit(msg.Chat.ID, statusMsgID, statusText, nil)
+		lastDownloadStatus = statusText
+	})
+	if err != nil {
+		slog.Error("download file", "error", err)
+		b.editFinal(msg.Chat.ID, statusMsgID, "Не удалось скачать файл.")
+		return
+	}
+	defer rc.Close()
+
+	b.edit(msg.Chat.ID, statusMsgID, "⏳ Отправляю файл на расшифровку...", nil)
+
+	opts := buildOptions(preset)
+	jobID, queuePos, err := b.client.Submit(rc, format, opts)
+	if err != nil {
+		if _, ok := errors.AsType[*whisper.UnavailableError](err); ok {
+			b.editFinal(msg.Chat.ID, statusMsgID, "Сервис транскрипции недоступен, попробуй позже.")
+		} else {
+			slog.Error("submit job", "error", err)
+			b.editFinal(msg.Chat.ID, statusMsgID, "Произошла ошибка при отправке на расшифровку.")
+		}
+		return
+	}
+
+	slog.Info("job submitted", "job_id", jobID, "queue_pos", queuePos, "preset", preset)
+
+	statusText := "⏳ Расшифровываю..."
+	if queuePos > 1 {
+		statusText = fmt.Sprintf("⏳ В очереди (позиция %d), подожди немного...", queuePos)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b.cancels.Store(jobID, cancel)
+	keyboard := cancelKeyboard(jobID)
+	b.edit(msg.Chat.ID, statusMsgID, statusText, &keyboard)
+
+	go b.pollAndUpdate(ctx, cancel, msg, statusMsgID, jobID, preset)
 }
 
 func (b *Bot) sendAsFile(orig *tgbotapi.Message, text string, replyToID int) {
@@ -442,12 +481,15 @@ func (b *Bot) replyTo(orig *tgbotapi.Message, text string) tgbotapi.Message {
 	return sent
 }
 
-func (b *Bot) edit(chatID int64, msgID int, text string, keyboard tgbotapi.InlineKeyboardMarkup) {
+func (b *Bot) edit(chatID int64, msgID int, text string, keyboard *tgbotapi.InlineKeyboardMarkup) {
 	textRunes := len([]rune(text))
 	slog.Info("editing message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
 	cfg := tgbotapi.NewEditMessageText(chatID, msgID, text)
-	cfg.ReplyMarkup = &keyboard
+	cfg.ReplyMarkup = keyboard
 	if _, err := b.api.Send(cfg); err != nil {
+		if isMessageNotModifiedError(err) {
+			return
+		}
 		slog.Error("edit message failed", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes, "error", err)
 	}
 }
@@ -458,8 +500,68 @@ func (b *Bot) editFinal(chatID int64, msgID int, text string) {
 	slog.Info("editing final message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
 	cfg := tgbotapi.NewEditMessageText(chatID, msgID, text)
 	if _, err := b.api.Send(cfg); err != nil {
+		if isMessageNotModifiedError(err) {
+			return
+		}
 		slog.Error("edit final message failed", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes, "error", err)
 	}
+}
+
+func isMessageNotModifiedError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "message is not modified")
+}
+
+type progressReadCloser struct {
+	reader       io.ReadCloser
+	total        int64
+	onProgress   func(downloaded, total int64)
+	downloaded   int64
+	lastReported int64
+}
+
+func newProgressReadCloser(reader io.ReadCloser, total int64, onProgress func(downloaded, total int64)) io.ReadCloser {
+	return &progressReadCloser{
+		reader:     reader,
+		total:      total,
+		onProgress: onProgress,
+	}
+}
+
+func (p *progressReadCloser) Read(buf []byte) (int, error) {
+	n, err := p.reader.Read(buf)
+	if n > 0 {
+		p.downloaded += int64(n)
+		if p.onProgress != nil && (p.total <= 0 || p.downloaded-p.lastReported >= 5*1024*1024 || p.downloaded == p.total) {
+			p.lastReported = p.downloaded
+			p.onProgress(p.downloaded, p.total)
+		}
+	}
+	return n, err
+}
+
+func (p *progressReadCloser) Close() error {
+	return p.reader.Close()
+}
+
+func formatDownloadStatus(downloaded, total int64) string {
+	if total > 0 {
+		percent := float64(downloaded) / float64(total) * 100
+		return fmt.Sprintf("⏳ Скачиваю видео... %.0f%%", percent)
+	}
+	return fmt.Sprintf("⏳ Скачиваю видео... %s", formatBytes(downloaded))
+}
+
+func formatBytes(size int64) string {
+	const unit = 1024
+	if size < unit {
+		return fmt.Sprintf("%d B", size)
+	}
+	div, exp := int64(unit), 0
+	for n := size / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(size)/float64(div), "KMGTPE"[exp])
 }
 
 // splitText splits text into chunks that fit within Telegram's message length limit.
