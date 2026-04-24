@@ -37,10 +37,13 @@ type Segment struct {
 // JobResult holds the outcome of an async transcription job.
 type JobResult struct {
 	Status          pb.JobStatus
+	Stage           string
 	Text            string
 	Error           string
 	Segments        []Segment
 	ProgressPercent float32
+	Attempts        int32
+	MaxAttempts     int32
 }
 
 type Client struct {
@@ -115,10 +118,13 @@ func (c *Client) GetStatus(jobID string) (*JobResult, error) {
 
 	return &JobResult{
 		Status:          resp.Status,
+		Stage:           resp.Stage,
 		Text:            resp.Text,
 		Error:           resp.Error,
 		Segments:        segs,
 		ProgressPercent: resp.ProgressPercent,
+		Attempts:        resp.Attempts,
+		MaxAttempts:     resp.MaxAttempts,
 	}, nil
 }
 

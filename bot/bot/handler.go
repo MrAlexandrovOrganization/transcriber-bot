@@ -51,20 +51,34 @@ func New(cfg *config.Config, wc *whisper.Client) (*Bot, error) {
 	if err != nil {
 		return nil, fmt.Errorf("init bot api: %w", err)
 	}
-	slog.Info("authorized", "username", api.Self.UserName)
+	slog.Info(
+		"authorized",
+		"username", api.Self.UserName,
+		"local_api_url", cfg.LocalAPIURL,
+		"root_id", cfg.RootID,
+	)
 	return &Bot{api: api, cfg: cfg, client: wc}, nil
 }
 
 func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-	for update := range b.api.GetUpdatesChan(u) {
+	slog.Info("starting updates loop", "timeout_sec", u.Timeout)
+	updates := b.api.GetUpdatesChan(u)
+	for update := range updates {
+		slog.Info(
+			"update received",
+			"update_id", update.UpdateID,
+			"has_message", update.Message != nil,
+			"has_callback", update.CallbackQuery != nil,
+		)
 		if update.CallbackQuery != nil {
 			go b.handleCallback(update.CallbackQuery)
 		} else {
 			go b.handle(update)
 		}
 	}
+	slog.Warn("updates channel closed")
 }
 
 func cancelKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
@@ -77,13 +91,22 @@ func cancelKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
 
 func (b *Bot) handle(update tgbotapi.Update) {
 	msg := update.Message
-	if msg == nil || msg.From == nil {
+	if msg == nil {
+		slog.Warn("update without message", "update_id", update.UpdateID)
+		return
+	}
+	if msg.From == nil {
+		slog.Warn("message without sender", "update_id", update.UpdateID, "chat_id", msg.Chat.ID)
 		return
 	}
 
 	slog.Info("incoming",
 		"update_id", update.UpdateID,
 		"user_id", msg.From.ID,
+		"chat_id", msg.Chat.ID,
+		"username", msg.From.UserName,
+		"text", msg.Text,
+		"is_command", msg.IsCommand(),
 		"voice", msg.Voice != nil,
 		"video_note", msg.VideoNote != nil,
 		"video", msg.Video != nil,
@@ -91,17 +114,19 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	)
 
 	if msg.From.ID != b.cfg.RootID {
-		slog.Warn("unauthorized", "user_id", msg.From.ID)
+		slog.Warn("unauthorized", "user_id", msg.From.ID, "expected_root_id", b.cfg.RootID)
 		return
 	}
 
 	if msg.IsCommand() {
+		slog.Info("dispatching command", "command", msg.Command(), "user_id", msg.From.ID)
 		b.handleCommand(msg)
 		return
 	}
 
 	fileID, format := extractFile(msg)
 	if fileID == "" {
+		slog.Info("message ignored: no supported media", "update_id", update.UpdateID, "user_id", msg.From.ID)
 		return
 	}
 	slog.Info("file received", "file_id", fileID, "format", format)
@@ -126,9 +151,13 @@ func (b *Bot) handle(update tgbotapi.Update) {
 func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 	switch msg.Command() {
 	case "start":
+		slog.Info("handling command", "command", "start", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 		b.replyTo(msg, "Привет! Отправь мне голосовое сообщение, кружочек или видео — я расшифрую их в текст.\n\nИспользуй /preset для выбора режима расшифровки.")
 	case "preset":
+		slog.Info("handling command", "command", "preset", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 		b.sendPresetKeyboard(msg)
+	default:
+		slog.Info("unknown command", "command", msg.Command(), "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 	}
 }
 
@@ -204,8 +233,11 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 			// clock := clocks[tick%len(clocks)]
 			// tick++
 			switch result.Status {
-			case pb.JobStatus_PENDING:
+			case pb.JobStatus_ACCEPTED, pb.JobStatus_DOWNLOADING, pb.JobStatus_QUEUED:
 				statusText := "⏳ В очереди..."
+				if result.Status == pb.JobStatus_DOWNLOADING {
+					statusText = "⏳ Файл загружен, ставлю в очередь..."
+				}
 				if statusText != lastStatusText {
 					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, &keyboard)
 					lastStatusText = statusText
@@ -264,6 +296,12 @@ func formatResult(result *whisper.JobResult, preset string) string {
 
 // handleCallback processes inline keyboard button presses.
 func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
+	slog.Info(
+		"callback received",
+		"id", cb.ID,
+		"data", cb.Data,
+		"from_user_id", cb.From.ID,
+	)
 	if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
 		slog.Warn("answer callback", "error", err)
 	}
@@ -363,10 +401,12 @@ func extractFile(msg *tgbotapi.Message) (fileID, format string) {
 }
 
 func (b *Bot) downloadFile(fileID string, onProgress func(downloaded, total int64)) (io.ReadCloser, error) {
+	slog.Info("requesting file info", "file_id", fileID)
 	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		return nil, fmt.Errorf("get file info: %w", err)
 	}
+		slog.Info("file info received", "file_id", fileID, "file_path", file.FilePath, "file_size", file.FileSize)
 
 	if b.cfg.LocalAPIURL != "" {
 		slog.Info("reading local file", "path", file.FilePath)
@@ -410,6 +450,15 @@ func (b *Bot) sendInitialStatus(msg *tgbotapi.Message) (tgbotapi.Message, error)
 }
 
 func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format, preset string) {
+	slog.Info(
+		"process file started",
+		"chat_id", msg.Chat.ID,
+		"message_id", msg.MessageID,
+		"status_msg_id", statusMsgID,
+		"file_id", fileID,
+		"format", format,
+		"preset", preset,
+	)
 	lastDownloadStatus := ""
 	rc, err := b.downloadFile(fileID, func(downloaded, total int64) {
 		statusText := formatDownloadStatus(downloaded, total)
