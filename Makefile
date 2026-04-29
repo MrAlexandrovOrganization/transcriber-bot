@@ -15,7 +15,7 @@ install:
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
 .PHONY: up
-up:
+up: proto
 	$(DOCKER_COMPOSE) up -d --build
 
 .PHONY: down
