@@ -16,6 +16,12 @@ services:
     networks:
       - default
 
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+
   bot:
     build:
       context: .
@@ -33,6 +39,12 @@ services:
       - whisper-net  # для whisper
     depends_on:
       - telegram-bot-api
+
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+          cpus: "0.25"
 
 volumes:
   telegram-bot-api-data:
