@@ -16,6 +16,12 @@ services:
     networks:
       - default
 
+    logging: &default-logging
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
     deploy:
       resources:
         limits:
@@ -39,6 +45,8 @@ services:
       - whisper-net  # для whisper
     depends_on:
       - telegram-bot-api
+
+    logging: *default-logging
 
     deploy:
       resources:
