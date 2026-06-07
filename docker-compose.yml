@@ -15,18 +15,9 @@ services:
     restart: unless-stopped
     networks:
       - default
-
-    logging: &default-logging
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-    deploy:
-      resources:
-        limits:
-          memory: 256m
-          cpus: "0.5"
+    extends:
+      file: docker-compose.base.yml
+      service: base
 
   bot:
     build:
@@ -45,14 +36,9 @@ services:
       - whisper-net  # для whisper
     depends_on:
       - telegram-bot-api
-
-    logging: *default-logging
-
-    deploy:
-      resources:
-        limits:
-          memory: 64m
-          cpus: "0.25"
+    extends:
+      file: docker-compose.base.yml
+      service: base
 
 volumes:
   telegram-bot-api-data:
