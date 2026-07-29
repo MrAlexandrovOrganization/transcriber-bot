@@ -5,3 +5,10 @@
 *_pb2.pyi
 
 bot/gen/
+
+# Test audio/data files — not source code
+to-transcribe/
+
+# Compiled binaries
+*.exe
+location
