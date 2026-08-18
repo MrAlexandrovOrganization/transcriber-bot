@@ -2,23 +2,10 @@ networks:
   default: {}
   whisper-net:
     external: true
+  telegram-net:
+    external: true
 
 services:
-  telegram-bot-api:
-    image: aiogram/telegram-bot-api:9.6
-    environment:
-      - TELEGRAM_API_ID=${TELEGRAM_API_ID}
-      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH}
-      - TELEGRAM_LOCAL=1
-    volumes:
-      - telegram-bot-api-data:/var/lib/telegram-bot-api
-    restart: unless-stopped
-    networks:
-      - default
-    extends:
-      file: docker-compose.base.yml
-      service: base
-
   bot:
     build:
       context: .
@@ -32,13 +19,14 @@ services:
       - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
     restart: unless-stopped
     networks:
-      - default      # для telegram-bot-api
-      - whisper-net  # для whisper
-    depends_on:
-      - telegram-bot-api
+      - default
+      - whisper-net       # shared Whisper transcription service
+      - telegram-net      # shared local Telegram Bot API (infra/telegram-bot-api)
     extends:
       file: docker-compose.base.yml
       service: base
 
 volumes:
   telegram-bot-api-data:
+    external: true
+    name: telegram-bot-api-data
