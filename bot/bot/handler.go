@@ -95,10 +95,13 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		return
 	}
 
+	isGroup := msg.Chat.Type == "group" || msg.Chat.Type == "supergroup"
+
 	slog.Info("incoming",
 		"update_id", update.UpdateID,
 		"user_id", msg.From.ID,
 		"chat_id", msg.Chat.ID,
+		"chat_type", msg.Chat.Type,
 		"username", msg.From.UserName,
 		"text", msg.Text,
 		"is_command", msg.IsCommand(),
@@ -108,14 +111,23 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		"document", msg.Document != nil,
 	)
 
-	if msg.From.ID != b.cfg.RootID {
+	if !isGroup && msg.From.ID != b.cfg.RootID {
 		slog.Warn("unauthorized", "user_id", msg.From.ID, "expected_root_id", b.cfg.RootID)
 		return
 	}
 
 	if msg.IsCommand() {
+		if isGroup && msg.From.ID != b.cfg.RootID {
+			slog.Info("group command ignored: not root", "command", msg.Command(), "user_id", msg.From.ID)
+			return
+		}
 		slog.Info("dispatching command", "command", msg.Command(), "user_id", msg.From.ID)
 		b.handleCommand(msg)
+		return
+	}
+
+	if isGroup && msg.Voice == nil && msg.VideoNote == nil {
+		slog.Info("group message ignored: not voice/video_note", "update_id", update.UpdateID, "user_id", msg.From.ID)
 		return
 	}
 
