@@ -413,7 +413,7 @@ func (b *Bot) downloadFile(fileID string, onProgress func(downloaded, total int6
 	}
 
 	fileURL := file.Link(b.cfg.BotToken)
-	slog.Info("downloading file", "url", fileURL)
+	slog.Info("downloading file")
 	resp, err := http.Get(fileURL) //nolint:noctx
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)

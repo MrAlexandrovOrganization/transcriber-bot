@@ -6,10 +6,16 @@ import (
 
 	"transcriber-bot/bot"
 	"transcriber-bot/config"
+	"transcriber-bot/redact"
 	"transcriber-bot/whisper"
 )
 
 func main() {
+	// Mask the bot token in all logs, including inside error messages
+	// and URLs returned by the Telegram API client.
+	logger := slog.New(redact.New(slog.NewTextHandler(os.Stderr, nil), os.Getenv("BOT_TOKEN")))
+	slog.SetDefault(logger)
+
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("config", "error", err)
