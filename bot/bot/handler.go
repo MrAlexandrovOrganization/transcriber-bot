@@ -392,20 +392,34 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 		"data", cb.Data,
 		"from_user_id", cb.From.ID,
 	)
-	if _, err := b.api.Request(tgbotapi.NewCallback(cb.ID, "")); err != nil {
-		slog.Warn("answer callback", "error", err)
-	}
-
 	switch {
 	case strings.HasPrefix(cb.Data, "cancel:"):
 		b.handleCancelCallback(cb)
 	case strings.HasPrefix(cb.Data, "preset:"):
 		b.handlePresetCallback(cb)
+	default:
+		b.answerCallback(cb.ID, "")
+	}
+}
+
+// answerCallback acknowledges a callback query, optionally showing text
+// as a popup to the user who pressed the button.
+func (b *Bot) answerCallback(id, text string) {
+	if _, err := b.api.Request(tgbotapi.NewCallback(id, text)); err != nil {
+		slog.Warn("answer callback", "error", err)
 	}
 }
 
 func (b *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 	jobID := strings.TrimPrefix(cb.Data, "cancel:")
+
+	if cb.From.ID != b.cfg.RootID {
+		slog.Warn("cancel denied: not root", "job_id", jobID, "user_id", cb.From.ID)
+		b.answerCallback(cb.ID, "Отменить расшифровку может только владелец бота.")
+		return
+	}
+
+	b.answerCallback(cb.ID, "")
 	slog.Info("cancel requested", "job_id", jobID)
 
 	val, ok := b.cancels.LoadAndDelete(jobID)
@@ -426,6 +440,7 @@ func (b *Bot) handlePresetCallback(cb *tgbotapi.CallbackQuery) {
 	if cb.Message == nil || cb.From == nil {
 		return
 	}
+	b.answerCallback(cb.ID, "")
 	presetName := strings.TrimPrefix(cb.Data, "preset:")
 
 	// Validate preset name.
