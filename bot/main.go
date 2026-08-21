@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 
 	"transcriber-bot/bot"
 	"transcriber-bot/config"
 	"transcriber-bot/redact"
+	"transcriber-bot/store"
 	"transcriber-bot/whisper"
 )
 
@@ -29,7 +31,14 @@ func main() {
 	}
 	defer wc.Close()
 
-	b, err := bot.New(cfg, wc)
+	chats, err := store.New(context.Background(), cfg.DatabaseURL)
+	if err != nil {
+		slog.Error("chat store", "error", err)
+		os.Exit(1)
+	}
+	defer chats.Close()
+
+	b, err := bot.New(cfg, wc, chats)
 	if err != nil {
 		slog.Error("bot init", "error", err)
 		os.Exit(1)

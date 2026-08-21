@@ -10,6 +10,7 @@ func TestLoad_OK(t *testing.T) {
 	t.Setenv("TELEGRAM_LOCAL_API_URL", "http://localhost:8081")
 	t.Setenv("WHISPER_GRPC_HOST", "myhost")
 	t.Setenv("WHISPER_GRPC_PORT", "1234")
+	t.Setenv("DATABASE_URL", "postgres://u:p@db:5432/test")
 
 	cfg, err := Load()
 	if err != nil {
@@ -30,14 +31,19 @@ func TestLoad_OK(t *testing.T) {
 	if cfg.WhisperPort != "1234" {
 		t.Errorf("WhisperPort = %q, want 1234", cfg.WhisperPort)
 	}
+	if cfg.DatabaseURL != "postgres://u:p@db:5432/test" {
+		t.Errorf("DatabaseURL = %q, want postgres://u:p@db:5432/test", cfg.DatabaseURL)
+	}
 }
 
 func TestLoad_Defaults(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "tok")
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost/test")
 	t.Setenv("ROOT_ID", "7")
 	t.Setenv("TELEGRAM_LOCAL_API_URL", "")
 	t.Setenv("WHISPER_GRPC_HOST", "")
 	t.Setenv("WHISPER_GRPC_PORT", "")
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost/test")
 
 	cfg, err := Load()
 	if err != nil {
@@ -65,6 +71,7 @@ func TestLoad_MissingToken(t *testing.T) {
 
 func TestLoad_MissingRootID(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "tok")
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost/test")
 	t.Setenv("ROOT_ID", "")
 
 	if _, err := Load(); err == nil {
@@ -74,6 +81,7 @@ func TestLoad_MissingRootID(t *testing.T) {
 
 func TestLoad_InvalidRootID(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "tok")
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost/test")
 	t.Setenv("ROOT_ID", "notanumber")
 
 	if _, err := Load(); err == nil {
@@ -83,6 +91,7 @@ func TestLoad_InvalidRootID(t *testing.T) {
 
 func TestLoad_ZeroRootID(t *testing.T) {
 	t.Setenv("BOT_TOKEN", "tok")
+	t.Setenv("DATABASE_URL", "postgres://u:p@localhost/test")
 	t.Setenv("ROOT_ID", "0")
 
 	if _, err := Load(); err == nil {

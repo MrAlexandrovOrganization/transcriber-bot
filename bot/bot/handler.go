@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"transcriber-bot/config"
 	pb "transcriber-bot/gen/whisper"
+	"transcriber-bot/store"
 	"transcriber-bot/whisper"
 )
 
@@ -29,11 +31,12 @@ type Bot struct {
 	api        *tgbotapi.BotAPI
 	cfg        *config.Config
 	client     *whisper.Client
+	chats      *store.Store
 	cancels    sync.Map // jobID → context.CancelFunc
 	userPreset sync.Map // userID → preset name (string)
 }
 
-func New(cfg *config.Config, wc *whisper.Client) (*Bot, error) {
+func New(cfg *config.Config, wc *whisper.Client, chats *store.Store) (*Bot, error) {
 	var (
 		api *tgbotapi.BotAPI
 		err error
@@ -52,7 +55,7 @@ func New(cfg *config.Config, wc *whisper.Client) (*Bot, error) {
 		"local_api_url", cfg.LocalAPIURL,
 		"root_id", cfg.RootID,
 	)
-	return &Bot{api: api, cfg: cfg, client: wc}, nil
+	return &Bot{api: api, cfg: cfg, client: wc, chats: chats}, nil
 }
 
 func (b *Bot) Run() {
@@ -66,10 +69,14 @@ func (b *Bot) Run() {
 			"update_id", update.UpdateID,
 			"has_message", update.Message != nil,
 			"has_callback", update.CallbackQuery != nil,
+			"has_my_chat_member", update.MyChatMember != nil,
 		)
-		if update.CallbackQuery != nil {
+		switch {
+		case update.CallbackQuery != nil:
 			go b.handleCallback(update.CallbackQuery)
-		} else {
+		case update.MyChatMember != nil:
+			go b.handleMyChatMember(update.MyChatMember)
+		default:
 			go b.handle(update)
 		}
 	}
@@ -84,6 +91,77 @@ func cancelKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
 	)
 }
 
+// isGroupChat reports whether the chat is a group or supergroup.
+// Private chats are authorized via ROOT_ID and are never stored.
+func isGroupChat(chat tgbotapi.Chat) bool {
+	return chat.Type == "group" || chat.Type == "supergroup"
+}
+
+// handleMyChatMember tracks chats where the bot was added or removed,
+// keeping the allowlist in sync with reality.
+func (b *Bot) handleMyChatMember(mcm *tgbotapi.ChatMemberUpdated) {
+	if !isGroupChat(mcm.Chat) {
+		slog.Debug("my_chat_member ignored: not a group", "chat_id", mcm.Chat.ID, "chat_type", mcm.Chat.Type)
+		return
+	}
+
+	newStatus := mcm.NewChatMember.Status
+	slog.Info(
+		"my_chat_member",
+		"chat_id", mcm.Chat.ID,
+		"title", mcm.Chat.Title,
+		"old_status", mcm.OldChatMember.Status,
+		"new_status", newStatus,
+	)
+
+	ctx := context.Background()
+	switch newStatus {
+	case "member", "administrator", "restricted":
+		added, err := b.chats.Add(ctx, mcm.Chat.ID, mcm.Chat.Title, mcm.From.ID)
+		if err != nil {
+			slog.Error("register chat", "chat_id", mcm.Chat.ID, "error", err)
+			return
+		}
+		if added {
+			slog.Info("chat registered", "chat_id", mcm.Chat.ID, "title", mcm.Chat.Title)
+		}
+	default: // left, kicked
+		if err := b.chats.Remove(ctx, mcm.Chat.ID); err != nil {
+			slog.Error("unregister chat", "chat_id", mcm.Chat.ID, "error", err)
+			return
+		}
+		slog.Info("chat unregistered", "chat_id", mcm.Chat.ID)
+	}
+}
+
+// authorizeGroup ensures the group chat is in the allowlist. If the event
+// about adding the bot was missed, the chat is registered lazily — but only
+// when the sender is root.
+func (b *Bot) authorizeGroup(msg *tgbotapi.Message) error {
+	ctx := context.Background()
+	allowed, err := b.chats.Exists(ctx, msg.Chat.ID)
+	if err != nil {
+		slog.Error("check chat allowed", "chat_id", msg.Chat.ID, "error", err)
+		return err
+	}
+	if allowed {
+		return nil
+	}
+	if msg.From.ID != b.cfg.RootID {
+		slog.Warn("unauthorized group", "chat_id", msg.Chat.ID, "title", msg.Chat.Title, "user_id", msg.From.ID)
+		return fmt.Errorf("unauthorized group %d", msg.Chat.ID)
+	}
+	added, err := b.chats.Add(ctx, msg.Chat.ID, msg.Chat.Title, msg.From.ID)
+	if err != nil {
+		slog.Error("register chat lazily", "chat_id", msg.Chat.ID, "error", err)
+		return err
+	}
+	if added {
+		slog.Info("chat registered lazily", "chat_id", msg.Chat.ID, "title", msg.Chat.Title)
+	}
+	return nil
+}
+
 func (b *Bot) handle(update tgbotapi.Update) {
 	msg := update.Message
 	if msg == nil {
@@ -95,7 +173,7 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		return
 	}
 
-	isGroup := msg.Chat.Type == "group" || msg.Chat.Type == "supergroup"
+	isGroup := isGroupChat(*msg.Chat)
 
 	slog.Info("incoming",
 		"update_id", update.UpdateID,
@@ -111,8 +189,12 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		"document", msg.Document != nil,
 	)
 
-	if !isGroup && msg.From.ID != b.cfg.RootID {
-		slog.Warn("unauthorized", "user_id", msg.From.ID, "expected_root_id", b.cfg.RootID)
+	if isGroup {
+		if err := b.authorizeGroup(msg); err != nil {
+			return
+		}
+	} else if msg.From.ID != b.cfg.RootID {
+		slog.Warn("unauthorized private message", "user_id", msg.From.ID, "expected_root_id", b.cfg.RootID)
 		return
 	}
 
@@ -127,7 +209,13 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	}
 
 	if isGroup && msg.Voice == nil && msg.VideoNote == nil {
-		slog.Info("group message ignored: not voice/video_note", "update_id", update.UpdateID, "user_id", msg.From.ID)
+		raw, _ := json.Marshal(msg)
+		slog.Info(
+			"group message ignored: not voice/video_note",
+			"update_id", update.UpdateID,
+			"user_id", msg.From.ID,
+			"raw_message", string(raw),
+		)
 		return
 	}
 

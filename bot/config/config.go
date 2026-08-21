@@ -12,6 +12,7 @@ type Config struct {
 	LocalAPIURL string
 	WhisperHost string
 	WhisperPort string
+	DatabaseURL string
 }
 
 func Load() (*Config, error) {
@@ -29,12 +30,18 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ROOT_ID must be a non-zero integer")
 	}
 
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return nil, fmt.Errorf("DATABASE_URL is not set")
+	}
+
 	return &Config{
 		BotToken:    token,
 		RootID:      rootID,
 		LocalAPIURL: os.Getenv("TELEGRAM_LOCAL_API_URL"),
 		WhisperHost: getEnv("WHISPER_GRPC_HOST", "localhost"),
 		WhisperPort: getEnv("WHISPER_GRPC_PORT", "50053"),
+		DatabaseURL: dsn,
 	}, nil
 }
 
