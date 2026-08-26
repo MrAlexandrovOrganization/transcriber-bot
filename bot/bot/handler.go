@@ -234,13 +234,14 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	effectivePreset := resolvePreset(storedPreset, msg)
 	slog.Info("using preset", "preset", effectivePreset)
 
-	statusMsg, err := b.sendInitialStatus(msg)
+	noun := mediaNoun(msg)
+	statusMsg, err := b.sendInitialStatus(msg, noun)
 	if err != nil {
 		slog.Error("send initial status message", "error", err)
 		return
 	}
 
-	go b.processFile(msg, statusMsg.MessageID, fileID, format, effectivePreset)
+	go b.processFile(msg, statusMsg.MessageID, fileID, format, noun, effectivePreset)
 }
 
 func (b *Bot) handleCommand(msg *tgbotapi.Message) {
@@ -541,8 +542,22 @@ func (b *Bot) downloadFile(fileID string, onProgress func(downloaded, total int6
 	return newProgressReadCloser(resp.Body, resp.ContentLength, onProgress), nil
 }
 
-func (b *Bot) sendInitialStatus(msg *tgbotapi.Message) (tgbotapi.Message, error) {
-	m := tgbotapi.NewMessage(msg.Chat.ID, "⏳ Скачиваю видео...")
+func mediaNoun(msg *tgbotapi.Message) string {
+	switch {
+	case msg.Voice != nil:
+		return "голосовое"
+	case msg.VideoNote != nil:
+		return "кружочек"
+	case msg.Video != nil:
+		return "видео"
+	case msg.Document != nil:
+		return "документ"
+	}
+	return "файл"
+}
+
+func (b *Bot) sendInitialStatus(msg *tgbotapi.Message, noun string) (tgbotapi.Message, error) {
+	m := tgbotapi.NewMessage(msg.Chat.ID, "⏳ Скачиваю "+noun+"...")
 	m.ReplyToMessageID = msg.MessageID
 
 	statusMsg, err := b.api.Send(m)
@@ -554,7 +569,7 @@ func (b *Bot) sendInitialStatus(msg *tgbotapi.Message) (tgbotapi.Message, error)
 	return statusMsg, nil
 }
 
-func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format, preset string) {
+func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format, noun, preset string) {
 	slog.Info(
 		"process file started",
 		"chat_id", msg.Chat.ID,
@@ -566,7 +581,7 @@ func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format
 	)
 	lastDownloadStatus := ""
 	rc, err := b.downloadFile(fileID, func(downloaded, total int64) {
-		statusText := formatDownloadStatus(downloaded, total)
+		statusText := formatDownloadStatus(downloaded, total, noun)
 		if statusText == lastDownloadStatus {
 			return
 		}
@@ -697,12 +712,12 @@ func (p *progressReadCloser) Close() error {
 	return p.reader.Close()
 }
 
-func formatDownloadStatus(downloaded, total int64) string {
+func formatDownloadStatus(downloaded, total int64, noun string) string {
 	if total > 0 {
 		percent := float64(downloaded) / float64(total) * 100
-		return fmt.Sprintf("⏳ Скачиваю видео... %.0f%%", percent)
+		return fmt.Sprintf("⏳ Скачиваю %s... %.0f%%", noun, percent)
 	}
-	return fmt.Sprintf("⏳ Скачиваю видео... %s", formatBytes(downloaded))
+	return fmt.Sprintf("⏳ Скачиваю %s... %s", noun, formatBytes(downloaded))
 }
 
 func formatBytes(size int64) string {
