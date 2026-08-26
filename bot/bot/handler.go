@@ -590,12 +590,12 @@ func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format
 	})
 	if err != nil {
 		slog.Error("download file", "error", err)
-		b.editFinal(msg.Chat.ID, statusMsgID, "Не удалось скачать файл.")
+		b.editFinal(msg.Chat.ID, statusMsgID, "❌ Не удалось скачать "+noun+": "+err.Error())
 		return
 	}
 	defer rc.Close()
 
-	b.edit(msg.Chat.ID, statusMsgID, "⏳ Отправляю файл на расшифровку...", nil)
+	b.edit(msg.Chat.ID, statusMsgID, "⏳ Отправляю на расшифровку...", nil)
 
 	opts := buildOptions(preset)
 	jobID, queuePos, err := b.client.Submit(rc, format, opts)
