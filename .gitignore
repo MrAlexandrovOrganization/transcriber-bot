@@ -12,3 +12,6 @@ to-transcribe/
 # Compiled binaries
 *.exe
 location
+
+# Downloaded build tools (buf, protoc-gen-go*)
+.bin/
