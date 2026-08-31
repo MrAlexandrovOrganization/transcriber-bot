@@ -25,6 +25,7 @@ const (
 	pollInterval = 5 * time.Second
 	pollDeadline = 3 * time.Hour
 	maxMsgRunes  = 4096 - 128 // Telegram message length limit
+	dedupTTL     = 1 * time.Hour
 )
 
 type Bot struct {
@@ -34,6 +35,8 @@ type Bot struct {
 	chats      *store.Store
 	cancels    sync.Map // jobID → context.CancelFunc
 	userPreset sync.Map // userID → preset name (string)
+
+	processedMsgs sync.Map // chatID:messageID → time.Time
 }
 
 func New(cfg *config.Config, wc *whisper.Client, chats *store.Store) (*Bot, error) {
@@ -58,7 +61,34 @@ func New(cfg *config.Config, wc *whisper.Client, chats *store.Store) (*Bot, erro
 	return &Bot{api: api, cfg: cfg, client: wc, chats: chats}, nil
 }
 
+func dedupKey(chatID int64, msgID int) string {
+	return fmt.Sprintf("%d:%d", chatID, msgID)
+}
+
+func (b *Bot) markProcessed(chatID int64, msgID int) bool {
+	key := dedupKey(chatID, msgID)
+	if _, loaded := b.processedMsgs.LoadOrStore(key, time.Now()); loaded {
+		return true // already seen
+	}
+	return false
+}
+
+func (b *Bot) startDedupCleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		cutoff := time.Now().Add(-dedupTTL)
+		b.processedMsgs.Range(func(key, value any) bool {
+			if t, ok := value.(time.Time); ok && t.Before(cutoff) {
+				b.processedMsgs.Delete(key)
+			}
+			return true
+		})
+	}
+}
+
 func (b *Bot) Run() {
+	go b.startDedupCleanup()
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	slog.Info("starting updates loop", "timeout_sec", u.Timeout)
@@ -170,6 +200,11 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	}
 	if msg.From == nil {
 		slog.Warn("message without sender", "update_id", update.UpdateID, "chat_id", msg.Chat.ID)
+		return
+	}
+
+	if b.markProcessed(msg.Chat.ID, msg.MessageID) {
+		slog.Info("duplicate message skipped", "chat_id", msg.Chat.ID, "message_id", msg.MessageID)
 		return
 	}
 
