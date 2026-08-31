@@ -6,9 +6,11 @@ import (
 	"io"
 	"time"
 
+	"go.opentelemetry.io/otel/propagation"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	pb "transcriber-bot/gen/whisper"
@@ -70,7 +72,12 @@ func (c *Client) Close() error {
 // queuePosition indicates where in the queue this job is (1 = will run next).
 // options may be nil to use server defaults.
 func (c *Client) Submit(r io.Reader, format string, options *pb.TranscriptionOptions) (jobID string, queuePosition int, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
+	return c.SubmitContext(context.Background(), r, format, options)
+}
+
+// SubmitContext uploads audio while propagating the active W3C trace context.
+func (c *Client) SubmitContext(parent context.Context, r io.Reader, format string, options *pb.TranscriptionOptions) (jobID string, queuePosition int, err error) {
+	ctx, cancel := context.WithTimeout(outgoingContext(parent), uploadTimeout)
 	defer cancel()
 
 	stream, err := c.stub.Submit(ctx)
@@ -91,7 +98,12 @@ func (c *Client) Submit(r io.Reader, format string, options *pb.TranscriptionOpt
 
 // Cancel requests cancellation of a job. Returns false if the job is already done.
 func (c *Client) Cancel(jobID string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)
+	return c.CancelContext(context.Background(), jobID)
+}
+
+// CancelContext requests cancellation while propagating the active W3C trace context.
+func (c *Client) CancelContext(parent context.Context, jobID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(outgoingContext(parent), pollTimeout)
 	defer cancel()
 
 	resp, err := c.stub.Cancel(ctx, &pb.CancelRequest{JobId: jobID})
@@ -103,7 +115,12 @@ func (c *Client) Cancel(jobID string) (bool, error) {
 
 // GetStatus polls the status of a submitted job.
 func (c *Client) GetStatus(jobID string) (*JobResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), pollTimeout)
+	return c.GetStatusContext(context.Background(), jobID)
+}
+
+// GetStatusContext polls while propagating the active W3C trace context.
+func (c *Client) GetStatusContext(parent context.Context, jobID string) (*JobResult, error) {
+	ctx, cancel := context.WithTimeout(outgoingContext(parent), pollTimeout)
 	defer cancel()
 
 	resp, err := c.stub.GetStatus(ctx, &pb.StatusRequest{JobId: jobID})
@@ -126,6 +143,19 @@ func (c *Client) GetStatus(jobID string) (*JobResult, error) {
 		Attempts:        resp.Attempts,
 		MaxAttempts:     resp.MaxAttempts,
 	}, nil
+}
+
+func outgoingContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	carrier := propagation.MapCarrier{}
+	propagation.TraceContext{}.Inject(ctx, carrier)
+	values := make([]string, 0, len(carrier)*2)
+	for key, value := range carrier {
+		values = append(values, key, value)
+	}
+	return metadata.AppendToOutgoingContext(ctx, values...)
 }
 
 // sendChunks sends audio data over a client-streaming RPC.

@@ -316,7 +316,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 			if ctx.Err() != nil {
 				return
 			}
-			result, err := b.client.GetStatus(jobID)
+			result, err := b.client.GetStatusContext(ctx, jobID)
 			if err != nil {
 				slog.Warn("poll status", "job_id", jobID, "error", err)
 				continue
@@ -430,7 +430,7 @@ func (b *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 	}
 	val.(context.CancelFunc)()
 
-	if cancelled, err := b.client.Cancel(jobID); err != nil {
+	if cancelled, err := b.client.CancelContext(context.Background(), jobID); err != nil {
 		slog.Warn("cancel job on backend", "job_id", jobID, "error", err)
 	} else {
 		slog.Info("cancel sent to backend", "job_id", jobID, "cancelled", cancelled)
@@ -598,7 +598,7 @@ func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format
 	b.edit(msg.Chat.ID, statusMsgID, "⏳ Отправляю на расшифровку...", nil)
 
 	opts := buildOptions(preset)
-	jobID, queuePos, err := b.client.Submit(rc, format, opts)
+	jobID, queuePos, err := b.client.SubmitContext(context.Background(), rc, format, opts)
 	if err != nil {
 		if _, ok := errors.AsType[*whisper.UnavailableError](err); ok {
 			b.editFinal(msg.Chat.ID, statusMsgID, "Сервис транскрипции недоступен, попробуй позже.")
