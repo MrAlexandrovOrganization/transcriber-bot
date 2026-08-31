@@ -4,6 +4,8 @@ networks:
     external: true
   telegram-net:
     external: true
+  jaeger-net:
+    external: true
 
 services:
   bot:
@@ -16,6 +18,8 @@ services:
       - WHISPER_GRPC_PORT=50053
       - TELEGRAM_LOCAL_API_URL=http://telegram-bot-api:8081
       - DATABASE_URL=postgres://transcriber:${POSTGRES_PASSWORD:-transcriber}@postgres:5432/transcriber?sslmode=disable
+      - OTEL_SERVICE_NAME=transcriber-bot
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
     depends_on:
       postgres:
         condition: service_healthy
@@ -26,6 +30,7 @@ services:
       - default
       - whisper-net       # shared Whisper transcription service
       - telegram-net      # shared local Telegram Bot API (infra/telegram-bot-api)
+      - jaeger-net        # shared tracing collector
     extends:
       file: docker-compose.base.yml
       service: base

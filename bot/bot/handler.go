@@ -14,6 +14,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"go.opentelemetry.io/otel"
 
 	"transcriber-bot/config"
 	pb "transcriber-bot/gen/whisper"
@@ -94,6 +95,7 @@ func (b *Bot) Run() {
 	slog.Info("starting updates loop", "timeout_sec", u.Timeout)
 	updates := b.api.GetUpdatesChan(u)
 	for update := range updates {
+		ctx, span := otel.Tracer("transcriber-bot").Start(context.Background(), "telegram.update")
 		slog.Info(
 			"update received",
 			"update_id", update.UpdateID,
@@ -103,11 +105,11 @@ func (b *Bot) Run() {
 		)
 		switch {
 		case update.CallbackQuery != nil:
-			go b.handleCallback(update.CallbackQuery)
+			go func() { defer span.End(); b.handleCallback(ctx, update.CallbackQuery) }()
 		case update.MyChatMember != nil:
-			go b.handleMyChatMember(update.MyChatMember)
+			go func() { defer span.End(); b.handleMyChatMember(ctx, update.MyChatMember) }()
 		default:
-			go b.handle(update)
+			go func() { defer span.End(); b.handle(ctx, update) }()
 		}
 	}
 	slog.Warn("updates channel closed")
@@ -129,14 +131,14 @@ func isGroupChat(chat tgbotapi.Chat) bool {
 
 // handleMyChatMember tracks chats where the bot was added or removed,
 // keeping the allowlist in sync with reality.
-func (b *Bot) handleMyChatMember(mcm *tgbotapi.ChatMemberUpdated) {
+func (b *Bot) handleMyChatMember(ctx context.Context, mcm *tgbotapi.ChatMemberUpdated) {
 	if !isGroupChat(mcm.Chat) {
-		slog.Debug("my_chat_member ignored: not a group", "chat_id", mcm.Chat.ID, "chat_type", mcm.Chat.Type)
+		slog.DebugContext(ctx, "my_chat_member ignored: not a group", "chat_id", mcm.Chat.ID, "chat_type", mcm.Chat.Type)
 		return
 	}
 
 	newStatus := mcm.NewChatMember.Status
-	slog.Info(
+	slog.InfoContext(ctx,
 		"my_chat_member",
 		"chat_id", mcm.Chat.ID,
 		"title", mcm.Chat.Title,
@@ -144,73 +146,71 @@ func (b *Bot) handleMyChatMember(mcm *tgbotapi.ChatMemberUpdated) {
 		"new_status", newStatus,
 	)
 
-	ctx := context.Background()
 	switch newStatus {
 	case "member", "administrator", "restricted":
 		added, err := b.chats.Add(ctx, mcm.Chat.ID, mcm.Chat.Title, mcm.From.ID)
 		if err != nil {
-			slog.Error("register chat", "chat_id", mcm.Chat.ID, "error", err)
+			slog.ErrorContext(ctx, "register chat", "chat_id", mcm.Chat.ID, "error", err)
 			return
 		}
 		if added {
-			slog.Info("chat registered", "chat_id", mcm.Chat.ID, "title", mcm.Chat.Title)
+			slog.InfoContext(ctx, "chat registered", "chat_id", mcm.Chat.ID, "title", mcm.Chat.Title)
 		}
 	default: // left, kicked
 		if err := b.chats.Remove(ctx, mcm.Chat.ID); err != nil {
-			slog.Error("unregister chat", "chat_id", mcm.Chat.ID, "error", err)
+			slog.ErrorContext(ctx, "unregister chat", "chat_id", mcm.Chat.ID, "error", err)
 			return
 		}
-		slog.Info("chat unregistered", "chat_id", mcm.Chat.ID)
+		slog.InfoContext(ctx, "chat unregistered", "chat_id", mcm.Chat.ID)
 	}
 }
 
 // authorizeGroup ensures the group chat is in the allowlist. If the event
 // about adding the bot was missed, the chat is registered lazily — but only
 // when the sender is root.
-func (b *Bot) authorizeGroup(msg *tgbotapi.Message) error {
-	ctx := context.Background()
+func (b *Bot) authorizeGroup(ctx context.Context, msg *tgbotapi.Message) error {
 	allowed, err := b.chats.Exists(ctx, msg.Chat.ID)
 	if err != nil {
-		slog.Error("check chat allowed", "chat_id", msg.Chat.ID, "error", err)
+		slog.ErrorContext(ctx, "check chat allowed", "chat_id", msg.Chat.ID, "error", err)
 		return err
 	}
 	if allowed {
 		return nil
 	}
 	if msg.From.ID != b.cfg.RootID {
-		slog.Warn("unauthorized group", "chat_id", msg.Chat.ID, "title", msg.Chat.Title, "user_id", msg.From.ID)
+		slog.WarnContext(ctx, "unauthorized group", "chat_id", msg.Chat.ID, "title", msg.Chat.Title, "user_id", msg.From.ID)
 		return fmt.Errorf("unauthorized group %d", msg.Chat.ID)
 	}
 	added, err := b.chats.Add(ctx, msg.Chat.ID, msg.Chat.Title, msg.From.ID)
 	if err != nil {
-		slog.Error("register chat lazily", "chat_id", msg.Chat.ID, "error", err)
+		slog.ErrorContext(ctx, "register chat lazily", "chat_id", msg.Chat.ID, "error", err)
 		return err
 	}
 	if added {
-		slog.Info("chat registered lazily", "chat_id", msg.Chat.ID, "title", msg.Chat.Title)
+		slog.InfoContext(ctx, "chat registered lazily", "chat_id", msg.Chat.ID, "title", msg.Chat.Title)
 	}
 	return nil
 }
 
-func (b *Bot) handle(update tgbotapi.Update) {
+func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 	msg := update.Message
 	if msg == nil {
-		slog.Warn("update without message", "update_id", update.UpdateID)
+		slog.WarnContext(ctx, "update without message", "update_id", update.UpdateID)
 		return
 	}
 	if msg.From == nil {
-		slog.Warn("message without sender", "update_id", update.UpdateID, "chat_id", msg.Chat.ID)
+		slog.WarnContext(ctx, "message without sender", "update_id", update.UpdateID, "chat_id", msg.Chat.ID)
 		return
 	}
 
 	if b.markProcessed(msg.Chat.ID, msg.MessageID) {
-		slog.Info("duplicate message skipped", "chat_id", msg.Chat.ID, "message_id", msg.MessageID)
+		slog.InfoContext(ctx, "duplicate message skipped", "chat_id", msg.Chat.ID, "message_id", msg.MessageID)
 		return
 	}
 
 	isGroup := isGroupChat(*msg.Chat)
 
-	slog.Info("incoming",
+	slog.InfoContext(ctx, "incoming",
 		"update_id", update.UpdateID,
 		"user_id", msg.From.ID,
 		"chat_id", msg.Chat.ID,
@@ -225,27 +225,27 @@ func (b *Bot) handle(update tgbotapi.Update) {
 	)
 
 	if isGroup {
-		if err := b.authorizeGroup(msg); err != nil {
+		if err := b.authorizeGroup(ctx, msg); err != nil {
 			return
 		}
 	} else if msg.From.ID != b.cfg.RootID {
-		slog.Warn("unauthorized private message", "user_id", msg.From.ID, "expected_root_id", b.cfg.RootID)
+		slog.WarnContext(ctx, "unauthorized private message", "user_id", msg.From.ID, "expected_root_id", b.cfg.RootID)
 		return
 	}
 
 	if msg.IsCommand() {
 		if isGroup && msg.From.ID != b.cfg.RootID {
-			slog.Info("group command ignored: not root", "command", msg.Command(), "user_id", msg.From.ID)
+			slog.InfoContext(ctx, "group command ignored: not root", "command", msg.Command(), "user_id", msg.From.ID)
 			return
 		}
-		slog.Info("dispatching command", "command", msg.Command(), "user_id", msg.From.ID)
-		b.handleCommand(msg)
+		slog.InfoContext(ctx, "dispatching command", "command", msg.Command(), "user_id", msg.From.ID)
+		b.handleCommand(ctx, msg)
 		return
 	}
 
 	if isGroup && msg.Voice == nil && msg.VideoNote == nil {
 		raw, _ := json.Marshal(msg)
-		slog.Info(
+		slog.InfoContext(ctx,
 			"group message ignored: not voice/video_note",
 			"update_id", update.UpdateID,
 			"user_id", msg.From.ID,
@@ -256,10 +256,10 @@ func (b *Bot) handle(update tgbotapi.Update) {
 
 	fileID, format := extractFile(msg)
 	if fileID == "" {
-		slog.Info("message ignored: no supported media", "update_id", update.UpdateID, "user_id", msg.From.ID)
+		slog.InfoContext(ctx, "message ignored: no supported media", "update_id", update.UpdateID, "user_id", msg.From.ID)
 		return
 	}
-	slog.Info("file received", "file_id", fileID, "format", format)
+	slog.InfoContext(ctx, "file received", "file_id", fileID, "format", format)
 
 	// Determine effective preset.
 	storedPreset := ""
@@ -267,28 +267,28 @@ func (b *Bot) handle(update tgbotapi.Update) {
 		storedPreset = v.(string)
 	}
 	effectivePreset := resolvePreset(storedPreset, msg)
-	slog.Info("using preset", "preset", effectivePreset)
+	slog.InfoContext(ctx, "using preset", "preset", effectivePreset)
 
 	noun := mediaNoun(msg)
-	statusMsg, err := b.sendInitialStatus(msg, noun)
+	statusMsg, err := b.sendInitialStatus(ctx, msg, noun)
 	if err != nil {
-		slog.Error("send initial status message", "error", err)
+		slog.ErrorContext(ctx, "send initial status message", "error", err)
 		return
 	}
 
-	go b.processFile(msg, statusMsg.MessageID, fileID, format, noun, effectivePreset)
+	go b.processFile(ctx, msg, statusMsg.MessageID, fileID, format, noun, effectivePreset)
 }
 
-func (b *Bot) handleCommand(msg *tgbotapi.Message) {
+func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 	switch msg.Command() {
 	case "start":
-		slog.Info("handling command", "command", "start", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
+		slog.InfoContext(ctx, "handling command", "command", "start", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 		b.replyTo(msg, "Привет! Отправь мне голосовое сообщение, кружочек или видео — я расшифрую их в текст.\n\nИспользуй /preset для выбора режима расшифровки.")
 	case "preset":
-		slog.Info("handling command", "command", "preset", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
+		slog.InfoContext(ctx, "handling command", "command", "preset", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 		b.sendPresetKeyboard(msg)
 	default:
-		slog.Info("unknown command", "command", msg.Command(), "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
+		slog.InfoContext(ctx, "unknown command", "command", msg.Command(), "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 	}
 }
 
@@ -329,7 +329,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 		b.cancels.Delete(jobID)
 	}()
 
-	slog.Info("polling started", "job_id", jobID, "status_msg_id", statusMsgID)
+	slog.InfoContext(ctx, "polling started", "job_id", jobID, "status_msg_id", statusMsgID)
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	deadline := time.After(pollDeadline)
@@ -340,11 +340,11 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("job cancelled", "job_id", jobID)
+			slog.InfoContext(ctx, "job cancelled", "job_id", jobID)
 			b.editFinal(origMsg.Chat.ID, statusMsgID, "❌ Отменено.")
 			return
 		case <-deadline:
-			slog.Warn("poll deadline exceeded", "job_id", jobID)
+			slog.WarnContext(ctx, "poll deadline exceeded", "job_id", jobID)
 			b.editFinal(origMsg.Chat.ID, statusMsgID, "Превышено время ожидания (3 часа). Попробуй ещё раз.")
 			return
 		case <-ticker.C:
@@ -353,10 +353,10 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 			}
 			result, err := b.client.GetStatusContext(ctx, jobID)
 			if err != nil {
-				slog.Warn("poll status", "job_id", jobID, "error", err)
+				slog.WarnContext(ctx, "poll status", "job_id", jobID, "error", err)
 				continue
 			}
-			slog.Info("poll status", "job_id", jobID, "status", result.Status)
+			slog.InfoContext(ctx, "poll status", "job_id", jobID, "status", result.Status)
 
 			switch result.Status {
 			case pb.JobStatus_ACCEPTED, pb.JobStatus_DOWNLOADING, pb.JobStatus_QUEUED:
@@ -382,7 +382,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 				if text == "" {
 					text = "(тишина)"
 				}
-				slog.Info("job done", "job_id", jobID, "text_runes", len([]rune(text)))
+				slog.InfoContext(ctx, "job done", "job_id", jobID, "text_runes", len([]rune(text)))
 				if preset == "lecture" {
 					b.editFinal(origMsg.Chat.ID, statusMsgID, "✅ Готово!")
 					b.sendAsFile(origMsg, text, origMsg.MessageID)
@@ -398,7 +398,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 				if result.Error == "cancelled" {
 					return // already handled via ctx.Done()
 				}
-				slog.Error("job failed", "job_id", jobID, "error", result.Error)
+				slog.ErrorContext(ctx, "job failed", "job_id", jobID, "error", result.Error)
 				b.editFinal(origMsg.Chat.ID, statusMsgID, "Произошла ошибка при расшифровке.")
 				return
 			}
@@ -421,8 +421,8 @@ func formatResult(result *whisper.JobResult, preset string) string {
 }
 
 // handleCallback processes inline keyboard button presses.
-func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
-	slog.Info(
+func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
+	slog.InfoContext(ctx,
 		"callback received",
 		"id", cb.ID,
 		"data", cb.Data,
@@ -430,9 +430,9 @@ func (b *Bot) handleCallback(cb *tgbotapi.CallbackQuery) {
 	)
 	switch {
 	case strings.HasPrefix(cb.Data, "cancel:"):
-		b.handleCancelCallback(cb)
+		b.handleCancelCallback(ctx, cb)
 	case strings.HasPrefix(cb.Data, "preset:"):
-		b.handlePresetCallback(cb)
+		b.handlePresetCallback(ctx, cb)
 	default:
 		b.answerCallback(cb.ID, "")
 	}
@@ -446,7 +446,7 @@ func (b *Bot) answerCallback(id, text string) {
 	}
 }
 
-func (b *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
+func (b *Bot) handleCancelCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	jobID := strings.TrimPrefix(cb.Data, "cancel:")
 
 	if cb.From.ID != b.cfg.RootID {
@@ -465,14 +465,14 @@ func (b *Bot) handleCancelCallback(cb *tgbotapi.CallbackQuery) {
 	}
 	val.(context.CancelFunc)()
 
-	if cancelled, err := b.client.CancelContext(context.Background(), jobID); err != nil {
+	if cancelled, err := b.client.CancelContext(ctx, jobID); err != nil {
 		slog.Warn("cancel job on backend", "job_id", jobID, "error", err)
 	} else {
 		slog.Info("cancel sent to backend", "job_id", jobID, "cancelled", cancelled)
 	}
 }
 
-func (b *Bot) handlePresetCallback(cb *tgbotapi.CallbackQuery) {
+func (b *Bot) handlePresetCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 	if cb.Message == nil || cb.From == nil {
 		return
 	}
@@ -541,16 +541,16 @@ func extractFile(msg *tgbotapi.Message) (fileID, format string) {
 	return "", ""
 }
 
-func (b *Bot) downloadFile(fileID string, onProgress func(downloaded, total int64)) (io.ReadCloser, error) {
-	slog.Info("requesting file info", "file_id", fileID)
+func (b *Bot) downloadFile(ctx context.Context, fileID string, onProgress func(downloaded, total int64)) (io.ReadCloser, error) {
+	slog.InfoContext(ctx, "requesting file info", "file_id", fileID)
 	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		return nil, fmt.Errorf("get file info: %w", err)
 	}
-	slog.Info("file info received", "file_id", fileID, "file_path", file.FilePath, "file_size", file.FileSize)
+	slog.InfoContext(ctx, "file info received", "file_id", fileID, "file_path", file.FilePath, "file_size", file.FileSize)
 
 	if b.cfg.LocalAPIURL != "" {
-		slog.Info("reading local file", "path", file.FilePath)
+		slog.InfoContext(ctx, "reading local file", "path", file.FilePath)
 		f, err := os.Open(file.FilePath)
 		if err != nil {
 			return nil, fmt.Errorf("open local file: %w", err)
@@ -564,8 +564,12 @@ func (b *Bot) downloadFile(fileID string, onProgress func(downloaded, total int6
 	}
 
 	fileURL := file.Link(b.cfg.BotToken)
-	slog.Info("downloading file")
-	resp, err := http.Get(fileURL) //nolint:noctx
+	slog.InfoContext(ctx, "downloading file")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create download request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
@@ -591,7 +595,7 @@ func mediaNoun(msg *tgbotapi.Message) string {
 	return "файл"
 }
 
-func (b *Bot) sendInitialStatus(msg *tgbotapi.Message, noun string) (tgbotapi.Message, error) {
+func (b *Bot) sendInitialStatus(ctx context.Context, msg *tgbotapi.Message, noun string) (tgbotapi.Message, error) {
 	m := tgbotapi.NewMessage(msg.Chat.ID, "⏳ Скачиваю "+noun+"...")
 	m.ReplyToMessageID = msg.MessageID
 
@@ -600,12 +604,12 @@ func (b *Bot) sendInitialStatus(msg *tgbotapi.Message, noun string) (tgbotapi.Me
 		return tgbotapi.Message{}, err
 	}
 
-	slog.Info("sent initial status", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
+	slog.InfoContext(ctx, "sent initial status", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
 	return statusMsg, nil
 }
 
-func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format, noun, preset string) {
-	slog.Info(
+func (b *Bot) processFile(ctx context.Context, msg *tgbotapi.Message, statusMsgID int, fileID, format, noun, preset string) {
+	slog.InfoContext(ctx,
 		"process file started",
 		"chat_id", msg.Chat.ID,
 		"message_id", msg.MessageID,
@@ -615,7 +619,7 @@ func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format
 		"preset", preset,
 	)
 	lastDownloadStatus := ""
-	rc, err := b.downloadFile(fileID, func(downloaded, total int64) {
+	rc, err := b.downloadFile(ctx, fileID, func(downloaded, total int64) {
 		statusText := formatDownloadStatus(downloaded, total, noun)
 		if statusText == lastDownloadStatus {
 			return
@@ -624,7 +628,7 @@ func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format
 		lastDownloadStatus = statusText
 	})
 	if err != nil {
-		slog.Error("download file", "error", err)
+		slog.ErrorContext(ctx, "download file", "error", err)
 		b.editFinal(msg.Chat.ID, statusMsgID, "❌ Не удалось скачать "+noun+": "+err.Error())
 		return
 	}
@@ -633,30 +637,30 @@ func (b *Bot) processFile(msg *tgbotapi.Message, statusMsgID int, fileID, format
 	b.edit(msg.Chat.ID, statusMsgID, "⏳ Отправляю на расшифровку...", nil)
 
 	opts := buildOptions(preset)
-	jobID, queuePos, err := b.client.SubmitContext(context.Background(), rc, format, opts)
+	jobID, queuePos, err := b.client.SubmitContext(ctx, rc, format, opts)
 	if err != nil {
 		if _, ok := errors.AsType[*whisper.UnavailableError](err); ok {
 			b.editFinal(msg.Chat.ID, statusMsgID, "Сервис транскрипции недоступен, попробуй позже.")
 		} else {
-			slog.Error("submit job", "error", err)
+			slog.ErrorContext(ctx, "submit job", "error", err)
 			b.editFinal(msg.Chat.ID, statusMsgID, "Произошла ошибка при отправке на расшифровку.")
 		}
 		return
 	}
 
-	slog.Info("job submitted", "job_id", jobID, "queue_pos", queuePos, "preset", preset)
+	slog.InfoContext(ctx, "job submitted", "job_id", jobID, "queue_pos", queuePos, "preset", preset)
 
 	statusText := "⏳ Расшифровываю..."
 	if queuePos > 1 {
 		statusText = fmt.Sprintf("⏳ В очереди (позиция %d), подожди немного...", queuePos)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	jobCtx, cancel := context.WithCancel(ctx)
 	b.cancels.Store(jobID, cancel)
 	keyboard := cancelKeyboard(jobID)
 	b.edit(msg.Chat.ID, statusMsgID, statusText, &keyboard)
 
-	go b.pollAndUpdate(ctx, cancel, msg, statusMsgID, jobID, preset)
+	go b.pollAndUpdate(jobCtx, cancel, msg, statusMsgID, jobID, preset)
 }
 
 func (b *Bot) sendAsFile(orig *tgbotapi.Message, text string, replyToID int) {

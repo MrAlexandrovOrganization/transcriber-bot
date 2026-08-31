@@ -4,9 +4,11 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 
 	"transcriber-bot/bot"
 	"transcriber-bot/config"
+	"transcriber-bot/internal/telemetry"
 	"transcriber-bot/logx"
 	"transcriber-bot/store"
 	"transcriber-bot/whisper"
@@ -16,6 +18,18 @@ func main() {
 	// JSON logs on stdout with a "service" attribute, LOG_LEVEL support,
 	// and masking of the bot token in all log records.
 	logx.Setup("transcriber-bot", os.Getenv("BOT_TOKEN"))
+	telemetryShutdown, err := telemetry.Setup(context.Background())
+	if err != nil {
+		slog.Error("telemetry", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := telemetryShutdown(ctx); err != nil {
+			slog.Error("telemetry shutdown", "error", err)
+		}
+	}()
 
 	cfg, err := config.Load()
 	if err != nil {
