@@ -14,7 +14,7 @@ export PATH := $(LOCAL_BIN):$(PATH)
 .PHONY: install
 install:
 	go install github.com/bufbuild/buf/cmd/buf@v1.67.0
-	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
 	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
 # Ensure buf + protoc plugins are available. Install into $(LOCAL_BIN) if missing
@@ -23,7 +23,7 @@ install:
 ensure-tools:
 	@mkdir -p $(LOCAL_BIN)
 	@command -v buf >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install github.com/bufbuild/buf/cmd/buf@v1.67.0
-	@command -v protoc-gen-go >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+	@command -v protoc-gen-go >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
 	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
 
 .PHONY: up
@@ -50,9 +50,20 @@ deploy:
 format:
 	gofmt -w ./bot
 
+.PHONY: fmt-check
+fmt-check:
+	@files="$$(gofmt -l ./bot)"; \
+	if test -n "$$files"; then \
+		printf '%s\n' "$$files"; \
+		exit 1; \
+	fi
+
 .PHONY: test
 test:
 	cd bot && go test ./...
+
+.PHONY: check
+check: fmt-check proto-lint test
 
 .PHONY: cover
 cover:

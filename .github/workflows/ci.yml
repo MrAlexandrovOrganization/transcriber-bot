@@ -27,8 +27,8 @@ jobs:
       - name: Generate proto stubs
         run: buf generate
 
-      - name: Lint
-        run: make format
+      - name: Check formatting
+        run: make fmt-check
 
       - name: Test
         run: make test

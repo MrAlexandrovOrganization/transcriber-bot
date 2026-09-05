@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,10 +22,13 @@ import (
 )
 
 const (
-	pollInterval = 5 * time.Second
-	pollDeadline = 3 * time.Hour
-	maxMsgRunes  = 4096 - 128 // Telegram message length limit
-	dedupTTL     = 1 * time.Hour
+	pollInterval         = 5 * time.Second
+	pollDeadline         = 3 * time.Hour
+	maxMsgRunes          = 4096 - 128 // Telegram message length limit
+	dedupTTL             = 1 * time.Hour
+	downloadTimeout      = 30 * time.Minute
+	maxConcurrentJobs    = 2
+	maxDownloadErrorBody = 4 * 1024
 )
 
 type Bot struct {
@@ -36,6 +38,7 @@ type Bot struct {
 	chats      *store.Store
 	cancels    sync.Map // jobID → context.CancelFunc
 	userPreset sync.Map // userID → preset name (string)
+	jobSlots   chan struct{}
 
 	processedMsgs sync.Map // chatID:messageID → time.Time
 }
@@ -59,7 +62,7 @@ func New(cfg *config.Config, wc *whisper.Client, chats *store.Store) (*Bot, erro
 		"local_api_url", cfg.LocalAPIURL,
 		"root_id", cfg.RootID,
 	)
-	return &Bot{api: api, cfg: cfg, client: wc, chats: chats}, nil
+	return &Bot{api: api, cfg: cfg, client: wc, chats: chats, jobSlots: make(chan struct{}, maxConcurrentJobs)}, nil
 }
 
 func dedupKey(chatID int64, msgID int) string {
@@ -216,7 +219,6 @@ func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 		"chat_id", msg.Chat.ID,
 		"chat_type", msg.Chat.Type,
 		"username", msg.From.UserName,
-		"text", msg.Text,
 		"is_command", msg.IsCommand(),
 		"voice", msg.Voice != nil,
 		"video_note", msg.VideoNote != nil,
@@ -244,12 +246,10 @@ func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 	}
 
 	if isGroup && msg.Voice == nil && msg.VideoNote == nil {
-		raw, _ := json.Marshal(msg)
 		slog.InfoContext(ctx,
 			"group message ignored: not voice/video_note",
 			"update_id", update.UpdateID,
 			"user_id", msg.From.ID,
-			"raw_message", string(raw),
 		)
 		return
 	}
@@ -259,7 +259,7 @@ func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 		slog.InfoContext(ctx, "message ignored: no supported media", "update_id", update.UpdateID, "user_id", msg.From.ID)
 		return
 	}
-	slog.InfoContext(ctx, "file received", "file_id", fileID, "format", format)
+	slog.InfoContext(ctx, "file received", "format", format)
 
 	// Determine effective preset.
 	storedPreset := ""
@@ -542,12 +542,12 @@ func extractFile(msg *tgbotapi.Message) (fileID, format string) {
 }
 
 func (b *Bot) downloadFile(ctx context.Context, fileID string, onProgress func(downloaded, total int64)) (io.ReadCloser, error) {
-	slog.InfoContext(ctx, "requesting file info", "file_id", fileID)
+	slog.InfoContext(ctx, "requesting file info")
 	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
 		return nil, fmt.Errorf("get file info: %w", err)
 	}
-	slog.InfoContext(ctx, "file info received", "file_id", fileID, "file_path", file.FilePath, "file_size", file.FileSize)
+	slog.InfoContext(ctx, "file info received", "file_size", file.FileSize)
 
 	if b.cfg.LocalAPIURL != "" {
 		slog.InfoContext(ctx, "reading local file", "path", file.FilePath)
@@ -569,12 +569,13 @@ func (b *Bot) downloadFile(ctx context.Context, fileID string, onProgress func(d
 	if err != nil {
 		return nil, fmt.Errorf("create download request: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: downloadTimeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxDownloadErrorBody))
 		resp.Body.Close()
 		return nil, fmt.Errorf("download failed: status %d, body: %s", resp.StatusCode, body)
 	}
@@ -609,12 +610,19 @@ func (b *Bot) sendInitialStatus(ctx context.Context, msg *tgbotapi.Message, noun
 }
 
 func (b *Bot) processFile(ctx context.Context, msg *tgbotapi.Message, statusMsgID int, fileID, format, noun, preset string) {
+	select {
+	case b.jobSlots <- struct{}{}:
+		defer func() { <-b.jobSlots }()
+	default:
+		b.editFinal(msg.Chat.ID, statusMsgID, "Сейчас уже обрабатываются два файла. Попробуй ещё раз позже.")
+		return
+	}
+
 	slog.InfoContext(ctx,
 		"process file started",
 		"chat_id", msg.Chat.ID,
 		"message_id", msg.MessageID,
 		"status_msg_id", statusMsgID,
-		"file_id", fileID,
 		"format", format,
 		"preset", preset,
 	)
@@ -629,7 +637,7 @@ func (b *Bot) processFile(ctx context.Context, msg *tgbotapi.Message, statusMsgI
 	})
 	if err != nil {
 		slog.ErrorContext(ctx, "download file", "error", err)
-		b.editFinal(msg.Chat.ID, statusMsgID, "❌ Не удалось скачать "+noun+": "+err.Error())
+		b.editFinal(msg.Chat.ID, statusMsgID, "❌ Не удалось скачать "+noun+". Попробуй ещё раз позже.")
 		return
 	}
 	defer rc.Close()
