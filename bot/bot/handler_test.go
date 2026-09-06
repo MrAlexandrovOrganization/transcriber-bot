@@ -1,10 +1,20 @@
 package bot
 
 import (
+	"errors"
 	"testing"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+func TestMaskBotToken(t *testing.T) {
+	err := errors.New(`Post "https://api.telegram.org/123456:secret/getUpdates": unexpected EOF`)
+	got := maskBotToken(err, "123456:secret")
+	want := `Post "https://api.telegram.org/***/getUpdates": unexpected EOF`
+	if got != want {
+		t.Fatalf("maskBotToken() = %q, want %q", got, want)
+	}
+}
 
 func TestExtractFile_Voice(t *testing.T) {
 	msg := &tgbotapi.Message{

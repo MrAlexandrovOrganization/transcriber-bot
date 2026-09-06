@@ -96,7 +96,7 @@ func (b *Bot) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	slog.Info("starting updates loop", "timeout_sec", u.Timeout)
-	updates := b.api.GetUpdatesChan(u)
+	updates := b.getUpdatesChan(u)
 	for update := range updates {
 		ctx, span := otel.Tracer("transcriber-bot").Start(context.Background(), "telegram.update")
 		slog.Info(
@@ -116,6 +116,42 @@ func (b *Bot) Run() {
 		}
 	}
 	slog.Warn("updates channel closed")
+}
+
+// getUpdatesChan is equivalent to tgbotapi.BotAPI.GetUpdatesChan, but does not
+// use the dependency's log.Println(error), which includes the bot token in the
+// request URL. Errors go through slog and are masked before logging.
+func (b *Bot) getUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
+	ch := make(chan tgbotapi.Update, b.api.Buffer)
+	go func() {
+		defer close(ch)
+		for {
+			updates, err := b.api.GetUpdates(config)
+			if err != nil {
+				slog.Warn("get updates failed", "error", maskBotToken(err, b.cfg.BotToken))
+				time.Sleep(3 * time.Second)
+				continue
+			}
+
+			for _, update := range updates {
+				if update.UpdateID >= config.Offset {
+					config.Offset = update.UpdateID + 1
+					ch <- update
+				}
+			}
+		}
+	}()
+	return ch
+}
+
+func maskBotToken(err error, token string) string {
+	if err == nil {
+		return ""
+	}
+	if token == "" {
+		return err.Error()
+	}
+	return strings.ReplaceAll(err.Error(), token, "***")
 }
 
 func cancelKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
