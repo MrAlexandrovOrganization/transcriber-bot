@@ -16,7 +16,9 @@ services:
     environment:
       - WHISPER_GRPC_HOST=whisper-ingress
       - WHISPER_GRPC_PORT=50053
-      - TELEGRAM_LOCAL_API_URL=http://telegram-bot-api:8081
+      - TELEGRAM_LOCAL_API_URL=
+      - HTTPS_PROXY=socks5://host.docker.internal:10880
+      - NO_PROXY=postgres,whisper-ingress,jaeger,localhost,127.0.0.1
       - DATABASE_URL=postgres://transcriber:${POSTGRES_PASSWORD:-transcriber}@postgres:5432/transcriber?sslmode=disable
       - OTEL_SERVICE_NAME=transcriber-bot
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
@@ -25,6 +27,8 @@ services:
         condition: service_healthy
     volumes:
       - telegram-bot-api-data:/var/lib/telegram-bot-api:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     networks:
       - default
