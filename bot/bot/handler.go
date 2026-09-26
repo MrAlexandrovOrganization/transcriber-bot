@@ -12,12 +12,14 @@ import (
 	"sync"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/mymmrac/telego"
+	tu "github.com/mymmrac/telego/telegoutil"
 	"go.opentelemetry.io/otel"
 
 	"transcriber-bot/config"
 	pb "transcriber-bot/gen/whisper"
 	"transcriber-bot/store"
+	"transcriber-bot/tgfmt"
 	"transcriber-bot/whisper"
 )
 
@@ -32,7 +34,7 @@ const (
 )
 
 type Bot struct {
-	api        *tgbotapi.BotAPI
+	api        *telego.Bot
 	cfg        *config.Config
 	client     *whisper.Client
 	chats      *store.Store
@@ -44,21 +46,25 @@ type Bot struct {
 }
 
 func New(cfg *config.Config, wc *whisper.Client, chats *store.Store) (*Bot, error) {
-	var (
-		api *tgbotapi.BotAPI
-		err error
-	)
-	if cfg.LocalAPIURL != "" {
-		api, err = tgbotapi.NewBotAPIWithAPIEndpoint(cfg.BotToken, cfg.LocalAPIURL+"/bot%s/%s")
-	} else {
-		api, err = tgbotapi.NewBotAPI(cfg.BotToken)
+	options := []telego.BotOption{
+		telego.WithHTTPClient(&http.Client{Timeout: 70 * time.Second}),
+		// All errors are logged by the application through its token-masking logger.
+		telego.WithDiscardLogger(),
 	}
+	if cfg.LocalAPIURL != "" {
+		options = append(options, telego.WithAPIServer(strings.TrimRight(cfg.LocalAPIURL, "/")))
+	}
+	api, err := telego.NewBot(cfg.BotToken, options...)
 	if err != nil {
 		return nil, fmt.Errorf("init bot api: %w", err)
 	}
+	self, err := api.GetMe(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("authorize bot api: %w", err)
+	}
 	slog.Info(
 		"authorized",
-		"username", api.Self.UserName,
+		"username", self.Username,
 		"local_api_url", cfg.LocalAPIURL,
 		"root_id", cfg.RootID,
 	)
@@ -93,8 +99,7 @@ func (b *Bot) startDedupCleanup() {
 
 func (b *Bot) Run() {
 	go b.startDedupCleanup()
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
+	u := telego.GetUpdatesParams{Timeout: 60, AllowedUpdates: []string{"message", "callback_query", "my_chat_member"}}
 	slog.Info("starting updates loop", "timeout_sec", u.Timeout)
 	updates := b.getUpdatesChan(u)
 	for update := range updates {
@@ -118,15 +123,13 @@ func (b *Bot) Run() {
 	slog.Warn("updates channel closed")
 }
 
-// getUpdatesChan is equivalent to tgbotapi.BotAPI.GetUpdatesChan, but does not
-// use the dependency's log.Println(error), which includes the bot token in the
-// request URL. Errors go through slog and are masked before logging.
-func (b *Bot) getUpdatesChan(config tgbotapi.UpdateConfig) tgbotapi.UpdatesChannel {
-	ch := make(chan tgbotapi.Update, b.api.Buffer)
+// getUpdatesChan preserves ordered offsets and retries with masked application logging.
+func (b *Bot) getUpdatesChan(config telego.GetUpdatesParams) <-chan telego.Update {
+	ch := make(chan telego.Update, 100)
 	go func() {
 		defer close(ch)
 		for {
-			updates, err := b.api.GetUpdates(config)
+			updates, err := b.api.GetUpdates(context.Background(), &config)
 			if err != nil {
 				slog.Warn("get updates failed", "error", maskBotToken(err, b.cfg.BotToken))
 				time.Sleep(3 * time.Second)
@@ -154,34 +157,30 @@ func maskBotToken(err error, token string) string {
 	return strings.ReplaceAll(err.Error(), token, "***")
 }
 
-func cancelKeyboard(jobID string) tgbotapi.InlineKeyboardMarkup {
-	return tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("❌ Отменить", "cancel:"+jobID),
-		),
-	)
+func cancelKeyboard(jobID string) *telego.InlineKeyboardMarkup {
+	return tu.InlineKeyboard(tu.InlineKeyboardRow(tu.InlineKeyboardButton("❌ Отменить").WithCallbackData("cancel:" + jobID)))
 }
 
 // isGroupChat reports whether the chat is a group or supergroup.
 // Private chats are authorized via ROOT_ID and are never stored.
-func isGroupChat(chat tgbotapi.Chat) bool {
+func isGroupChat(chat telego.Chat) bool {
 	return chat.Type == "group" || chat.Type == "supergroup"
 }
 
 // handleMyChatMember tracks chats where the bot was added or removed,
 // keeping the allowlist in sync with reality.
-func (b *Bot) handleMyChatMember(ctx context.Context, mcm *tgbotapi.ChatMemberUpdated) {
+func (b *Bot) handleMyChatMember(ctx context.Context, mcm *telego.ChatMemberUpdated) {
 	if !isGroupChat(mcm.Chat) {
 		slog.DebugContext(ctx, "my_chat_member ignored: not a group", "chat_id", mcm.Chat.ID, "chat_type", mcm.Chat.Type)
 		return
 	}
 
-	newStatus := mcm.NewChatMember.Status
+	newStatus := mcm.NewChatMember.MemberStatus()
 	slog.InfoContext(ctx,
 		"my_chat_member",
 		"chat_id", mcm.Chat.ID,
 		"title", mcm.Chat.Title,
-		"old_status", mcm.OldChatMember.Status,
+		"old_status", mcm.OldChatMember.MemberStatus(),
 		"new_status", newStatus,
 	)
 
@@ -207,7 +206,7 @@ func (b *Bot) handleMyChatMember(ctx context.Context, mcm *tgbotapi.ChatMemberUp
 // authorizeGroup ensures the group chat is in the allowlist. If the event
 // about adding the bot was missed, the chat is registered lazily — but only
 // when the sender is root.
-func (b *Bot) authorizeGroup(ctx context.Context, msg *tgbotapi.Message) error {
+func (b *Bot) authorizeGroup(ctx context.Context, msg *telego.Message) error {
 	allowed, err := b.chats.Exists(ctx, msg.Chat.ID)
 	if err != nil {
 		slog.ErrorContext(ctx, "check chat allowed", "chat_id", msg.Chat.ID, "error", err)
@@ -231,7 +230,7 @@ func (b *Bot) authorizeGroup(ctx context.Context, msg *tgbotapi.Message) error {
 	return nil
 }
 
-func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
+func (b *Bot) handle(ctx context.Context, update telego.Update) {
 	msg := update.Message
 	if msg == nil {
 		slog.WarnContext(ctx, "update without message", "update_id", update.UpdateID)
@@ -247,15 +246,15 @@ func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
-	isGroup := isGroupChat(*msg.Chat)
+	isGroup := isGroupChat(msg.Chat)
 
 	slog.InfoContext(ctx, "incoming",
 		"update_id", update.UpdateID,
 		"user_id", msg.From.ID,
 		"chat_id", msg.Chat.ID,
 		"chat_type", msg.Chat.Type,
-		"username", msg.From.UserName,
-		"is_command", msg.IsCommand(),
+		"username", msg.From.Username,
+		"is_command", messageCommand(msg) != "",
 		"voice", msg.Voice != nil,
 		"video_note", msg.VideoNote != nil,
 		"video", msg.Video != nil,
@@ -271,12 +270,12 @@ func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 		return
 	}
 
-	if msg.IsCommand() {
+	if messageCommand(msg) != "" {
 		if isGroup && msg.From.ID != b.cfg.RootID {
-			slog.InfoContext(ctx, "group command ignored: not root", "command", msg.Command(), "user_id", msg.From.ID)
+			slog.InfoContext(ctx, "group command ignored: not root", "command", messageCommand(msg), "user_id", msg.From.ID)
 			return
 		}
-		slog.InfoContext(ctx, "dispatching command", "command", msg.Command(), "user_id", msg.From.ID)
+		slog.InfoContext(ctx, "dispatching command", "command", messageCommand(msg), "user_id", msg.From.ID)
 		b.handleCommand(ctx, msg)
 		return
 	}
@@ -315,8 +314,17 @@ func (b *Bot) handle(ctx context.Context, update tgbotapi.Update) {
 	go b.processFile(ctx, msg, statusMsg.MessageID, fileID, format, noun, effectivePreset)
 }
 
-func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
-	switch msg.Command() {
+// Telegram marks commands with entities; plain text beginning with '/' is not sufficient.
+func messageCommand(msg *telego.Message) string {
+	if len(msg.Entities) == 0 || msg.Entities[0].Type != "bot_command" || msg.Entities[0].Offset != 0 {
+		return ""
+	}
+	command, _, _ := tu.ParseCommand(msg.Text)
+	return command
+}
+
+func (b *Bot) handleCommand(ctx context.Context, msg *telego.Message) {
+	switch messageCommand(msg) {
 	case "start":
 		slog.InfoContext(ctx, "handling command", "command", "start", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 		b.replyTo(msg, "Привет! Отправь мне голосовое сообщение, кружочек или видео — я расшифрую их в текст.\n\nИспользуй /preset для выбора режима расшифровки.")
@@ -324,42 +332,42 @@ func (b *Bot) handleCommand(ctx context.Context, msg *tgbotapi.Message) {
 		slog.InfoContext(ctx, "handling command", "command", "preset", "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 		b.sendPresetKeyboard(msg)
 	default:
-		slog.InfoContext(ctx, "unknown command", "command", msg.Command(), "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
+		slog.InfoContext(ctx, "unknown command", "command", messageCommand(msg), "chat_id", msg.Chat.ID, "user_id", msg.From.ID)
 	}
 }
 
-func (b *Bot) sendPresetKeyboard(msg *tgbotapi.Message) {
+func (b *Bot) sendPresetKeyboard(msg *telego.Message) {
 	currentPreset := "auto"
 	if v, ok := b.userPreset.Load(msg.From.ID); ok {
 		currentPreset = v.(string)
 	}
 
 	// Build keyboard: 2 buttons per row.
-	var rows [][]tgbotapi.InlineKeyboardButton
+	var rows [][]telego.InlineKeyboardButton
 	for i := 0; i < len(availablePresets); i += 2 {
-		var row []tgbotapi.InlineKeyboardButton
+		var row []telego.InlineKeyboardButton
 		for j := i; j < i+2 && j < len(availablePresets); j++ {
 			p := availablePresets[j]
 			label := p.label
 			if p.name == currentPreset {
 				label += " ✓"
 			}
-			row = append(row, tgbotapi.NewInlineKeyboardButtonData(label, "preset:"+p.name))
+			row = append(row, tu.InlineKeyboardButton(label).WithCallbackData("preset:"+p.name))
 		}
 		rows = append(rows, row)
 	}
 
 	currentLabel := presetLabels[currentPreset]
-	m := tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Выбери режим расшифровки.\nТекущий: %s", currentLabel))
-	m.ReplyToMessageID = msg.MessageID
-	m.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-	if _, err := b.api.Send(m); err != nil {
+	m := messageParams(msg.Chat.ID, tgfmt.Escape(fmt.Sprintf("Выбери режим расшифровки.\nТекущий: %s", currentLabel)))
+	m.ReplyParameters = &telego.ReplyParameters{MessageID: msg.MessageID, ChatID: tu.ID(msg.Chat.ID)}
+	m.ReplyMarkup = tu.InlineKeyboard(rows...)
+	if _, err := b.api.SendMessage(context.Background(), m); err != nil {
 		slog.Error("send preset keyboard", "error", err)
 	}
 }
 
 // pollAndUpdate periodically polls the job status and edits the status message when done.
-func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *tgbotapi.Message, statusMsgID int, jobID, preset string) {
+func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *telego.Message, statusMsgID int, jobID, preset string) {
 	defer func() {
 		cancel()
 		b.cancels.Delete(jobID)
@@ -401,7 +409,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 					statusText = "⏳ Файл загружен, ставлю в очередь..."
 				}
 				if statusText != lastStatusText {
-					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, &keyboard)
+					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, keyboard)
 					lastStatusText = statusText
 				}
 			case pb.JobStatus_RUNNING:
@@ -410,7 +418,7 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 					statusText = fmt.Sprintf("⏳ Расшифровываю... %.0f%%", result.ProgressPercent)
 				}
 				if statusText != lastStatusText {
-					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, &keyboard)
+					b.edit(origMsg.Chat.ID, statusMsgID /*clock+*/, statusText, keyboard)
 					lastStatusText = statusText
 				}
 			case pb.JobStatus_DONE:
@@ -457,7 +465,7 @@ func formatResult(result *whisper.JobResult, preset string) string {
 }
 
 // handleCallback processes inline keyboard button presses.
-func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
+func (b *Bot) handleCallback(ctx context.Context, cb *telego.CallbackQuery) {
 	slog.InfoContext(ctx,
 		"callback received",
 		"id", cb.ID,
@@ -477,12 +485,12 @@ func (b *Bot) handleCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
 // answerCallback acknowledges a callback query, optionally showing text
 // as a popup to the user who pressed the button.
 func (b *Bot) answerCallback(id, text string) {
-	if _, err := b.api.Request(tgbotapi.NewCallback(id, text)); err != nil {
+	if err := b.api.AnswerCallbackQuery(context.Background(), &telego.AnswerCallbackQueryParams{CallbackQueryID: id, Text: text}); err != nil {
 		slog.Warn("answer callback", "error", err)
 	}
 }
 
-func (b *Bot) handleCancelCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
+func (b *Bot) handleCancelCallback(ctx context.Context, cb *telego.CallbackQuery) {
 	jobID := strings.TrimPrefix(cb.Data, "cancel:")
 
 	if cb.From.ID != b.cfg.RootID {
@@ -508,8 +516,8 @@ func (b *Bot) handleCancelCallback(ctx context.Context, cb *tgbotapi.CallbackQue
 	}
 }
 
-func (b *Bot) handlePresetCallback(ctx context.Context, cb *tgbotapi.CallbackQuery) {
-	if cb.Message == nil || cb.From == nil {
+func (b *Bot) handlePresetCallback(ctx context.Context, cb *telego.CallbackQuery) {
+	if cb.Message == nil {
 		return
 	}
 	b.answerCallback(cb.ID, "")
@@ -534,32 +542,28 @@ func (b *Bot) handlePresetCallback(ctx context.Context, cb *tgbotapi.CallbackQue
 	label := presetLabels[presetName]
 
 	// Update the keyboard to show the new selection.
-	var rows [][]tgbotapi.InlineKeyboardButton
+	var rows [][]telego.InlineKeyboardButton
 	for i := 0; i < len(availablePresets); i += 2 {
-		var row []tgbotapi.InlineKeyboardButton
+		var row []telego.InlineKeyboardButton
 		for j := i; j < i+2 && j < len(availablePresets); j++ {
 			p := availablePresets[j]
 			btnLabel := p.label
 			if p.name == presetName {
 				btnLabel += " ✓"
 			}
-			row = append(row, tgbotapi.NewInlineKeyboardButtonData(btnLabel, "preset:"+p.name))
+			row = append(row, tu.InlineKeyboardButton(btnLabel).WithCallbackData("preset:"+p.name))
 		}
 		rows = append(rows, row)
 	}
 
-	edit := tgbotapi.NewEditMessageTextAndMarkup(
-		cb.Message.Chat.ID,
-		cb.Message.MessageID,
-		fmt.Sprintf("Выбери режим расшифровки.\nТекущий: %s", label),
-		tgbotapi.NewInlineKeyboardMarkup(rows...),
-	)
-	if _, err := b.api.Send(edit); err != nil {
+	edit := editParams(cb.Message.GetChat().ID, cb.Message.GetMessageID(), tgfmt.Escape(fmt.Sprintf("Выбери режим расшифровки.\nТекущий: %s", label)))
+	edit.ReplyMarkup = tu.InlineKeyboard(rows...)
+	if _, err := b.api.EditMessageText(ctx, edit); err != nil {
 		slog.Warn("update preset keyboard", "error", err)
 	}
 }
 
-func extractFile(msg *tgbotapi.Message) (fileID, format string) {
+func extractFile(msg *telego.Message) (fileID, format string) {
 	switch {
 	case msg.Voice != nil:
 		return msg.Voice.FileID, "ogg"
@@ -579,7 +583,7 @@ func extractFile(msg *tgbotapi.Message) (fileID, format string) {
 
 func (b *Bot) downloadFile(ctx context.Context, fileID string, onProgress func(downloaded, total int64)) (io.ReadCloser, error) {
 	slog.InfoContext(ctx, "requesting file info")
-	file, err := b.api.GetFile(tgbotapi.FileConfig{FileID: fileID})
+	file, err := b.api.GetFile(ctx, &telego.GetFileParams{FileID: fileID})
 	if err != nil {
 		return nil, fmt.Errorf("get file info: %w", err)
 	}
@@ -599,7 +603,7 @@ func (b *Bot) downloadFile(ctx context.Context, fileID string, onProgress func(d
 		return f, nil
 	}
 
-	fileURL := file.Link(b.cfg.BotToken)
+	fileURL := b.api.FileDownloadURL(file.FilePath)
 	slog.InfoContext(ctx, "downloading file")
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fileURL, nil)
 	if err != nil {
@@ -618,7 +622,7 @@ func (b *Bot) downloadFile(ctx context.Context, fileID string, onProgress func(d
 	return newProgressReadCloser(resp.Body, resp.ContentLength, onProgress), nil
 }
 
-func mediaNoun(msg *tgbotapi.Message) string {
+func mediaNoun(msg *telego.Message) string {
 	switch {
 	case msg.Voice != nil:
 		return "голосовое"
@@ -632,20 +636,20 @@ func mediaNoun(msg *tgbotapi.Message) string {
 	return "файл"
 }
 
-func (b *Bot) sendInitialStatus(ctx context.Context, msg *tgbotapi.Message, noun string) (tgbotapi.Message, error) {
-	m := tgbotapi.NewMessage(msg.Chat.ID, "⏳ Скачиваю "+noun+"...")
-	m.ReplyToMessageID = msg.MessageID
+func (b *Bot) sendInitialStatus(ctx context.Context, msg *telego.Message, noun string) (*telego.Message, error) {
+	m := messageParams(msg.Chat.ID, tgfmt.Escape("⏳ Скачиваю "+noun+"..."))
+	m.ReplyParameters = &telego.ReplyParameters{MessageID: msg.MessageID, ChatID: tu.ID(msg.Chat.ID)}
 
-	statusMsg, err := b.api.Send(m)
+	statusMsg, err := b.api.SendMessage(ctx, m)
 	if err != nil {
-		return tgbotapi.Message{}, err
+		return nil, err
 	}
 
 	slog.InfoContext(ctx, "sent initial status", "chat_id", msg.Chat.ID, "msg_id", statusMsg.MessageID)
 	return statusMsg, nil
 }
 
-func (b *Bot) processFile(ctx context.Context, msg *tgbotapi.Message, statusMsgID int, fileID, format, noun, preset string) {
+func (b *Bot) processFile(ctx context.Context, msg *telego.Message, statusMsgID int, fileID, format, noun, preset string) {
 	select {
 	case b.jobSlots <- struct{}{}:
 		defer func() { <-b.jobSlots }()
@@ -702,29 +706,29 @@ func (b *Bot) processFile(ctx context.Context, msg *tgbotapi.Message, statusMsgI
 	jobCtx, cancel := context.WithCancel(ctx)
 	b.cancels.Store(jobID, cancel)
 	keyboard := cancelKeyboard(jobID)
-	b.edit(msg.Chat.ID, statusMsgID, statusText, &keyboard)
+	b.edit(msg.Chat.ID, statusMsgID, statusText, keyboard)
 
 	go b.pollAndUpdate(jobCtx, cancel, msg, statusMsgID, jobID, preset)
 }
 
-func (b *Bot) sendAsFile(orig *tgbotapi.Message, text string, replyToID int) {
+func (b *Bot) sendAsFile(orig *telego.Message, text string, replyToID int) {
 	fileName := fmt.Sprintf("lecture_%d.txt", orig.MessageID)
-	doc := tgbotapi.NewDocument(orig.Chat.ID, tgbotapi.FileBytes{
-		Name:  fileName,
-		Bytes: []byte(text),
-	})
-	doc.ReplyToMessageID = replyToID
-	if _, err := b.api.Send(doc); err != nil {
+	doc := &telego.SendDocumentParams{
+		ChatID:          tu.ID(orig.Chat.ID),
+		Document:        tu.FileFromBytes([]byte(text), fileName),
+		ReplyParameters: &telego.ReplyParameters{MessageID: replyToID, ChatID: tu.ID(orig.Chat.ID)},
+	}
+	if _, err := b.api.SendDocument(context.Background(), doc); err != nil {
 		slog.Error("send file failed", "chat_id", orig.Chat.ID, "error", err)
 	} else {
 		slog.Info("sent as file", "chat_id", orig.Chat.ID, "file", fileName)
 	}
 }
 
-func (b *Bot) replyTo(orig *tgbotapi.Message, text string) tgbotapi.Message {
-	m := tgbotapi.NewMessage(orig.Chat.ID, text)
-	m.ReplyToMessageID = orig.MessageID
-	sent, err := b.api.Send(m)
+func (b *Bot) replyTo(orig *telego.Message, text string) *telego.Message {
+	m := messageParams(orig.Chat.ID, tgfmt.Escape(text))
+	m.ReplyParameters = &telego.ReplyParameters{MessageID: orig.MessageID, ChatID: tu.ID(orig.Chat.ID)}
+	sent, err := b.api.SendMessage(context.Background(), m)
 	if err != nil {
 		slog.Error("reply failed", "chat_id", orig.Chat.ID, "text_runes", len([]rune(text)), "error", err)
 	} else {
@@ -733,12 +737,12 @@ func (b *Bot) replyTo(orig *tgbotapi.Message, text string) tgbotapi.Message {
 	return sent
 }
 
-func (b *Bot) edit(chatID int64, msgID int, text string, keyboard *tgbotapi.InlineKeyboardMarkup) {
+func (b *Bot) edit(chatID int64, msgID int, text string, keyboard *telego.InlineKeyboardMarkup) {
 	textRunes := len([]rune(text))
 	slog.Info("editing message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
-	cfg := tgbotapi.NewEditMessageText(chatID, msgID, text)
+	cfg := editParams(chatID, msgID, tgfmt.Escape(text))
 	cfg.ReplyMarkup = keyboard
-	if _, err := b.api.Send(cfg); err != nil {
+	if _, err := b.api.EditMessageText(context.Background(), cfg); err != nil {
 		if isMessageNotModifiedError(err) {
 			return
 		}
@@ -750,13 +754,21 @@ func (b *Bot) edit(chatID int64, msgID int, text string, keyboard *tgbotapi.Inli
 func (b *Bot) editFinal(chatID int64, msgID int, text string) {
 	textRunes := len([]rune(text))
 	slog.Info("editing final message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
-	cfg := tgbotapi.NewEditMessageText(chatID, msgID, text)
-	if _, err := b.api.Send(cfg); err != nil {
+	cfg := editParams(chatID, msgID, tgfmt.Escape(text))
+	if _, err := b.api.EditMessageText(context.Background(), cfg); err != nil {
 		if isMessageNotModifiedError(err) {
 			return
 		}
 		slog.Error("edit final message failed", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes, "error", err)
 	}
+}
+
+func messageParams(chatID int64, text tgfmt.HTML) *telego.SendMessageParams {
+	return &telego.SendMessageParams{ChatID: tu.ID(chatID), Text: string(text), ParseMode: telego.ModeHTML}
+}
+
+func editParams(chatID int64, msgID int, text tgfmt.HTML) *telego.EditMessageTextParams {
+	return &telego.EditMessageTextParams{ChatID: tu.ID(chatID), MessageID: msgID, Text: string(text), ParseMode: telego.ModeHTML}
 }
 
 func isMessageNotModifiedError(err error) bool {

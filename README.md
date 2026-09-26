@@ -56,7 +56,26 @@ Edit message → transcription text
 ## Prerequisites
 
 - Docker & Docker Compose
+- Go 1.26.7 for local development (also pinned in Docker and CI)
 - Whisper backend running (see [backends/transcriber](../backends/transcriber))
+
+The Telegram client uses `github.com/mymmrac/telego` v1.12.1 with long polling.
+It supports both the public Telegram API and `LOCAL_API_URL`; with the local API,
+downloaded files are read from the shared filesystem as before.
+
+## Development checks
+
+```bash
+make install     # Install pinned buf/protobuf tools into Go's bin directory
+make proto-gen   # Generate stubs from the checked-in proto, no backend checkout needed
+make check       # Formatting, proto lint, unit tests and go vet
+make test-race   # Run tests with the race detector
+make build       # Build all Go packages
+```
+
+Make selects the exact Go 1.26.7 toolchain (downloaded automatically by Go if needed).
+Ensure `$(go env GOPATH)/bin` is on PATH for tools installed by `make install`.
+Telegram integration tests use a local fake API and synthetic tokens.
 
 ## Setup
 

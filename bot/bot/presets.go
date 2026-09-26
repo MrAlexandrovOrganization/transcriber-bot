@@ -3,7 +3,7 @@ package bot
 import (
 	pb "transcriber-bot/gen/whisper"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/mymmrac/telego"
 )
 
 type preset struct {
@@ -28,7 +28,7 @@ var presetLabels = func() map[string]string {
 
 // resolvePreset returns the effective preset for a message.
 // If userPreset is "auto" or empty, it auto-detects from the message.
-func resolvePreset(userPreset string, msg *tgbotapi.Message) string {
+func resolvePreset(userPreset string, msg *telego.Message) string {
 	if userPreset != "" && userPreset != "auto" {
 		return userPreset
 	}

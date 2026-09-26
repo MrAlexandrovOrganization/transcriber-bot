@@ -1,4 +1,4 @@
-FROM golang:1.26.1-alpine AS builder
+FROM golang:1.26.7-alpine AS builder
 
 RUN apk add --no-cache protobuf-dev && \
     go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5 && \

@@ -1,4 +1,5 @@
 DOCKER_COMPOSE = docker compose
+export GOTOOLCHAIN := go1.26.7
 
 # Canonical source of whisper.proto.
 # For remote fetch (e.g. in CI without access to the backend repo):
@@ -50,20 +51,31 @@ deploy:
 format:
 	gofmt -w ./bot
 
-.PHONY: fmt-check
-fmt-check:
+.PHONY: check
+check: proto-lint test
 	@files="$$(gofmt -l ./bot)"; \
 	if test -n "$$files"; then \
 		printf '%s\n' "$$files"; \
 		exit 1; \
 	fi
+	cd bot && go vet ./...
 
 .PHONY: test
 test:
 	cd bot && go test ./...
 
-.PHONY: check
-check: fmt-check proto-lint test
+.PHONY: build
+build:
+	cd bot && go build ./...
+
+.PHONY: test-race
+test-race:
+	cd bot && go test -race ./...
+
+# Generate from the checked-in schema, without requiring a neighboring checkout.
+.PHONY: proto-gen
+proto-gen: ensure-tools
+	buf generate
 
 .PHONY: cover
 cover:

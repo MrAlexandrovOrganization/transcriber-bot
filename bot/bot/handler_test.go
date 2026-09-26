@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/mymmrac/telego"
 )
 
 func TestMaskBotToken(t *testing.T) {
@@ -17,8 +17,8 @@ func TestMaskBotToken(t *testing.T) {
 }
 
 func TestExtractFile_Voice(t *testing.T) {
-	msg := &tgbotapi.Message{
-		Voice: &tgbotapi.Voice{FileID: "voice-123"},
+	msg := &telego.Message{
+		Voice: &telego.Voice{FileID: "voice-123"},
 	}
 	fileID, format := extractFile(msg)
 	if fileID != "voice-123" {
@@ -30,8 +30,8 @@ func TestExtractFile_Voice(t *testing.T) {
 }
 
 func TestExtractFile_VideoNote(t *testing.T) {
-	msg := &tgbotapi.Message{
-		VideoNote: &tgbotapi.VideoNote{FileID: "vnote-456"},
+	msg := &telego.Message{
+		VideoNote: &telego.VideoNote{FileID: "vnote-456"},
 	}
 	fileID, format := extractFile(msg)
 	if fileID != "vnote-456" {
@@ -43,8 +43,8 @@ func TestExtractFile_VideoNote(t *testing.T) {
 }
 
 func TestExtractFile_Video(t *testing.T) {
-	msg := &tgbotapi.Message{
-		Video: &tgbotapi.Video{FileID: "vid-789"},
+	msg := &telego.Message{
+		Video: &telego.Video{FileID: "vid-789"},
 	}
 	fileID, format := extractFile(msg)
 	if fileID != "vid-789" {
@@ -69,8 +69,8 @@ func TestExtractFile_Document(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			msg := &tgbotapi.Message{
-				Document: &tgbotapi.Document{
+			msg := &telego.Message{
+				Document: &telego.Document{
 					FileID:   "doc-id",
 					FileName: tt.fileName,
 				},
@@ -87,7 +87,7 @@ func TestExtractFile_Document(t *testing.T) {
 }
 
 func TestExtractFile_NoMedia(t *testing.T) {
-	msg := &tgbotapi.Message{
+	msg := &telego.Message{
 		Text: "just a text message",
 	}
 	fileID, format := extractFile(msg)
