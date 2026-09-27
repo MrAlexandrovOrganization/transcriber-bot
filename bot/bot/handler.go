@@ -432,9 +432,9 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 					b.sendAsFile(origMsg, text, origMsg.MessageID)
 				} else {
 					parts := splitText(text)
-					b.editFinal(origMsg.Chat.ID, statusMsgID, parts[0])
+					b.editFinalHTML(origMsg.Chat.ID, statusMsgID, quoteText(parts[0]))
 					for _, part := range parts[1:] {
-						b.replyTo(origMsg, part)
+						b.replyToHTML(origMsg, quoteText(part))
 					}
 				}
 				return
@@ -462,6 +462,11 @@ func formatResult(result *whisper.JobResult, preset string) string {
 		return strings.TrimSpace(sb.String())
 	}
 	return result.Text
+}
+
+// quoteText renders a transcription result as a Telegram block quote.
+func quoteText(text string) tgfmt.HTML {
+	return tgfmt.Blockquote(tgfmt.Escape(text))
 }
 
 // handleCallback processes inline keyboard button presses.
@@ -726,7 +731,11 @@ func (b *Bot) sendAsFile(orig *telego.Message, text string, replyToID int) {
 }
 
 func (b *Bot) replyTo(orig *telego.Message, text string) *telego.Message {
-	m := messageParams(orig.Chat.ID, tgfmt.Escape(text))
+	return b.replyToHTML(orig, tgfmt.Escape(text))
+}
+
+func (b *Bot) replyToHTML(orig *telego.Message, text tgfmt.HTML) *telego.Message {
+	m := messageParams(orig.Chat.ID, text)
 	m.ReplyParameters = &telego.ReplyParameters{MessageID: orig.MessageID, ChatID: tu.ID(orig.Chat.ID)}
 	sent, err := b.api.SendMessage(context.Background(), m)
 	if err != nil {
@@ -752,9 +761,13 @@ func (b *Bot) edit(chatID int64, msgID int, text string, keyboard *telego.Inline
 
 // editFinal edits the message text and removes the inline keyboard.
 func (b *Bot) editFinal(chatID int64, msgID int, text string) {
+	b.editFinalHTML(chatID, msgID, tgfmt.Escape(text))
+}
+
+func (b *Bot) editFinalHTML(chatID int64, msgID int, text tgfmt.HTML) {
 	textRunes := len([]rune(text))
 	slog.Info("editing final message", "chat_id", chatID, "msg_id", msgID, "text_runes", textRunes)
-	cfg := editParams(chatID, msgID, tgfmt.Escape(text))
+	cfg := editParams(chatID, msgID, text)
 	if _, err := b.api.EditMessageText(context.Background(), cfg); err != nil {
 		if isMessageNotModifiedError(err) {
 			return

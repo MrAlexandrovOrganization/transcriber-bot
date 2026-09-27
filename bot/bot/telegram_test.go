@@ -83,6 +83,16 @@ func TestTelegramMessagesAndKeyboards(t *testing.T) {
 	if r.body["reply_markup"] != nil || r.body["text"] != "Текст &lt;записи&gt; &amp; результат" || r.body["parse_mode"] != "HTML" {
 		t.Fatalf("unexpected final edit: %+v", r)
 	}
+	b.editFinalHTML(7, 42, quoteText("Расшифровка <текста>"))
+	r = <-requests
+	if r.body["text"] != "<blockquote>Расшифровка &lt;текста&gt;</blockquote>" || r.body["parse_mode"] != "HTML" {
+		t.Fatalf("unexpected quoted edit: %+v", r)
+	}
+	b.replyToHTML(msg, quoteText("часть 2"))
+	r = <-requests
+	if r.method != "sendMessage" || r.body["text"] != "<blockquote>часть 2</blockquote>" {
+		t.Fatalf("unexpected quoted reply: %+v", r)
+	}
 	b.sendPresetKeyboard(msg)
 	r = <-requests
 	if r.method != "sendMessage" || r.body["reply_markup"] == nil {
