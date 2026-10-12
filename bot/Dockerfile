@@ -1,8 +1,15 @@
-FROM golang:1.26.7-alpine AS builder
+# check=skip=InvalidDefaultArgInFrom
+
+# Required version arguments are supplied by Make/Compose, without fallback pins.
+ARG GO_VERSION
+ARG ALPINE_VERSION
+FROM golang:${GO_VERSION}-alpine AS builder
+ARG PROTOC_GEN_GO_VERSION
+ARG PROTOC_GEN_GO_GRPC_VERSION
 
 RUN apk add --no-cache protobuf-dev && \
-    go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5 && \
-    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
+    go install google.golang.org/protobuf/cmd/protoc-gen-go@${PROTOC_GEN_GO_VERSION} && \
+    go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v${PROTOC_GEN_GO_GRPC_VERSION}
 
 WORKDIR /build
 
@@ -21,7 +28,7 @@ RUN mkdir -p gen/whisper && \
 RUN CGO_ENABLED=0 GOOS=linux go build -o /bot .
 
 
-FROM alpine:3.20
+FROM alpine:${ALPINE_VERSION}
 
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /bot /bot

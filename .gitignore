@@ -15,3 +15,6 @@ location
 
 # Downloaded build tools (buf, protoc-gen-go*)
 .bin/
+
+# Local image release manifests and activation state
+/.images/

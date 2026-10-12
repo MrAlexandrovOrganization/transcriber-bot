@@ -12,6 +12,11 @@ services:
     build:
       context: .
       dockerfile: bot/Dockerfile
+      args:
+        GO_VERSION: ${GO_VERSION:?Run via make}
+        ALPINE_VERSION: ${ALPINE_VERSION:?Run via make}
+        PROTOC_GEN_GO_VERSION: ${PROTOC_GEN_GO_VERSION:?Run via make}
+        PROTOC_GEN_GO_GRPC_VERSION: ${PROTOC_GEN_GO_GRPC_VERSION:?Run via make}
     env_file: .env
     environment:
       - WHISPER_GRPC_HOST=whisper-ingress
@@ -40,7 +45,7 @@ services:
       service: base
 
   postgres:
-    image: postgres:17-alpine
+    image: postgres:${POSTGRES_VERSION:?Run via make}
     environment:
       - POSTGRES_USER=transcriber
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}

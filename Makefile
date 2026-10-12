@@ -1,5 +1,6 @@
 DOCKER_COMPOSE = docker compose
-export GOTOOLCHAIN := go1.26.7
+include versions.mk
+export GOTOOLCHAIN := go$(GO_VERSION)
 
 # Canonical source of whisper.proto.
 # For remote fetch (e.g. in CI without access to the backend repo):
@@ -14,18 +15,18 @@ export PATH := $(LOCAL_BIN):$(PATH)
 #   macOS: brew install bufbuild/buf/buf
 .PHONY: install
 install:
-	go install github.com/bufbuild/buf/cmd/buf@v1.67.0
-	go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
-	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
+	go install github.com/bufbuild/buf/cmd/buf@v$(BUF_VERSION)
+	go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v$(PROTOC_GEN_GO_GRPC_VERSION)
 
 # Ensure buf + protoc plugins are available. Install into $(LOCAL_BIN) if missing
 # so the build works on hosts (e.g. CI runners) that don't have them preinstalled.
 .PHONY: ensure-tools
 ensure-tools:
 	@mkdir -p $(LOCAL_BIN)
-	@command -v buf >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install github.com/bufbuild/buf/cmd/buf@v1.67.0
-	@command -v protoc-gen-go >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.5
-	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.1
+	@command -v buf >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install github.com/bufbuild/buf/cmd/buf@v$(BUF_VERSION)
+	@command -v protoc-gen-go >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO_VERSION)
+	@command -v protoc-gen-go-grpc >/dev/null 2>&1 || GOBIN=$(LOCAL_BIN) go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v$(PROTOC_GEN_GO_GRPC_VERSION)
 
 .PHONY: up
 up: proto
@@ -97,3 +98,32 @@ proto: ensure-tools
 .PHONY: proto-lint
 proto-lint:
 	buf lint proto
+
+.PHONY: versions compose-build
+versions:
+	@$(foreach v,$(VERSION_VARS),printf '%s=%s\n' '$(v)' '$($(v))';)
+compose-build:
+	$(DOCKER_COMPOSE) build
+
+# CI builds/publishes once; VM activates immutable digests (Python 3 + Docker required).
+export IMAGE_COMPOSE_FILE := docker-compose.yml
+.PHONY: image-build image-publish image-deploy image-activate
+image-build:
+	python3 scripts/images.py build
+image-publish:
+	python3 scripts/images.py publish
+image-deploy:
+	python3 scripts/images.py deploy
+image-activate:
+	$(IMAGE_COMPOSE) up -d --no-build --pull never --wait --wait-timeout 180
+
+.PHONY: image-check
+image-check:
+	python3 -B scripts/test_images.py
+
+.PHONY: image-compose
+export IMAGE_ARGS
+image-compose:
+	python3 scripts/images.py compose
+
+include makefiles/ci-deploy.mk
