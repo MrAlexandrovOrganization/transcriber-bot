@@ -9,6 +9,7 @@ networks:
 
 services:
   bot:
+    container_name: "${CONTAINER_NAME_PREFIX:-}transcriber-bot"
     build:
       context: .
       dockerfile: bot/Dockerfile
@@ -45,6 +46,7 @@ services:
       service: base
 
   postgres:
+    container_name: "${CONTAINER_NAME_PREFIX:-}transcriber-bot-postgres"
     image: postgres:${POSTGRES_VERSION:?Run via make}
     environment:
       - POSTGRES_USER=transcriber
