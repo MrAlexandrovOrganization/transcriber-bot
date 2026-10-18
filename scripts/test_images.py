@@ -95,13 +95,14 @@ class DeliveryTests(unittest.TestCase):
     def test_success_preserves_override_and_previous_manifest(self):
         self.save_manifest()
         images.write(images.STATE / "current.json", {"old": True})
-        (self.root / "docker-compose.override.yml").write_text("services: {}")
+        (self.root / "compose").mkdir(exist_ok=True)
+        (self.root / "compose/docker-compose.override.yml").write_text("services: {}")
         with patch.object(images, "run") as run:
             images.deploy()
         calls = [call.args for call in run.call_args_list]
         self.assertEqual(calls[0][:2], ("docker", "pull"))
         self.assertEqual(calls[-1][:2], ("make", "image-activate"))
-        self.assertIn("docker-compose.override.yml", calls[-1][2])
+        self.assertIn("compose/docker-compose.override.yml", calls[-1][2])
         self.assertEqual(
             json.loads((images.STATE / "current.json").read_text()), self.manifest
         )
@@ -178,6 +179,14 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(images, "deploy") as deploy:
             images.locked_deploy()
         deploy.assert_called_once()
+
+
+    def test_legacy_selector_resolves_moved_file(self):
+        (self.root / "compose").mkdir(exist_ok=True)
+        (self.root / "compose/compose.yaml").write_text("services: {}")
+        with patch.dict(os.environ, {"COMPOSE_FILE": "compose.yaml"}):
+            command = images.compose(runtime=True)
+        self.assertEqual(command[-2:], ["-f", "compose/compose.yaml"])
 
 
 if __name__ == "__main__":

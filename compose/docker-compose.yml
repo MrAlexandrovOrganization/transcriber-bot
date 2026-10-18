@@ -42,7 +42,7 @@ services:
       - telegram-net      # shared local Telegram Bot API (infra/telegram-bot-api)
       - jaeger-net        # shared tracing collector
     extends:
-      file: docker-compose.base.yml
+      file: compose/docker-compose.base.yml
       service: base
 
   postgres:
@@ -61,7 +61,7 @@ services:
       timeout: 3s
       retries: 10
     extends:
-      file: docker-compose.base.yml
+      file: compose/docker-compose.base.yml
       service: base
 
 volumes:

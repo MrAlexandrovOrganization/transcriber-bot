@@ -17,7 +17,7 @@ The Whisper backend lives in a separate project: `backends/transcriber`.
 | `bot/whisper/client.go` | gRPC client — Submit (async) + GetStatus |
 | `bot/config/config.go` | Loads env vars, validates `BOT_TOKEN`, `ROOT_ID`, `DATABASE_URL` |
 | `proto/whisper.proto` | gRPC service definition — source of truth for all clients |
-| `docker-compose.yml` | Bot + postgres + telegram-bot-api services (requires external `whisper-net`) |
+| `compose/docker-compose.yml` | Bot + postgres + telegram-bot-api services (requires external `whisper-net`) |
 | `Makefile` | All dev and deploy commands |
 
 ## Running & Building

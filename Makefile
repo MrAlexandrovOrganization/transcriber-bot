@@ -1,4 +1,6 @@
-DOCKER_COMPOSE = docker compose
+DOCKER_COMPOSE_BASE = docker compose --project-directory "$(CURDIR)"
+include makefiles/compose.mk
+DOCKER_COMPOSE = docker compose --project-directory "$(CURDIR)" $(COMPOSE_FLAGS)
 include versions.mk
 export GOTOOLCHAIN := go$(GO_VERSION)
 
@@ -106,7 +108,7 @@ compose-build:
 	$(DOCKER_COMPOSE) build
 
 # CI builds/publishes once; VM activates immutable digests (Python 3 + Docker required).
-export IMAGE_COMPOSE_FILE := docker-compose.yml
+export IMAGE_COMPOSE_FILE := compose/docker-compose.yml
 .PHONY: image-build image-publish image-deploy image-activate
 image-build:
 	python3 scripts/images.py build
@@ -127,3 +129,10 @@ image-compose:
 	python3 scripts/images.py compose
 
 include makefiles/ci-deploy.mk
+
+# Read-only validation of every tracked Compose combination, without runtime secrets.
+.PHONY: compose-layout-check
+compose-layout-check:
+	$(DOCKER_COMPOSE_BASE) --env-file /dev/null -f compose/docker-compose.yml --profile '*' config --no-interpolate --no-env-resolution --quiet
+
+check: compose-layout-check

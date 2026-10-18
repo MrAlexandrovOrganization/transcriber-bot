@@ -32,13 +32,16 @@ def compose(runtime=False):
         os.pathsep
     )
     if runtime and "COMPOSE_FILE" not in os.environ:
-        override = ROOT / "docker-compose.override.yml"
+        override = ROOT / "compose/docker-compose.override.yml"
         if override.exists():
-            files.append(override.name)
+            files.append(str(override.relative_to(ROOT)))
     command = ["docker", "compose", "--project-directory", str(ROOT)]
     if os.environ.get("IMAGE_PROJECT_NAME"):
         command += ["-p", os.environ["IMAGE_PROJECT_NAME"]]
     for file in files:
+        # Preserve existing private COMPOSE_FILE selectors after the layout move.
+        if Path(file).name == file and (ROOT / "compose" / file).is_file():
+            file = "compose/" + file
         command += ["-f", file]
     return command
 
@@ -241,8 +244,8 @@ def deploy():
         candidate = Path(directory) / "compose.json"
         write(candidate, override)
         command = compose(runtime=True)
-        if (ROOT / "compose.images.yaml").exists():
-            command += ["-f", "compose.images.yaml"]
+        if (ROOT / "compose/compose.images.yaml").exists():
+            command += ["-f", "compose/compose.images.yaml"]
         command += ["-f", str(candidate)]
         # Pull third-party dependencies too; failure leaves the old services intact.
         run(*command, "pull")
@@ -267,8 +270,8 @@ def operate():
     if args[0] == "run":
         args[1:1] = ["--no-build", "--pull", "never"]
     command = compose(runtime=True)
-    if (ROOT / "compose.images.yaml").exists():
-        command += ["-f", "compose.images.yaml"]
+    if (ROOT / "compose/compose.images.yaml").exists():
+        command += ["-f", "compose/compose.images.yaml"]
     run(*command, "-f", str(STATE / "compose.json"), *args)
 
 
