@@ -233,3 +233,22 @@ unchanged; clients address services or explicit network aliases.
 к прежним именам файлов, сохранив прежний набор overlays и порядок. Для плавного
 перехода Make также распознаёт прежние короткие имена, если файлы уже перенесены.
 Не меняйте project name и не удаляйте прежние тома для переноса файлов.
+
+## Hostkey Russia deployment
+
+Since 19 October 2026, the bot and its PostgreSQL run on `hostkey-russia`.
+The backend coordinator runs there too; inference runs on remote workers.
+Repository-level `VM_HOST`, `VM_USER` and `VM_SSH_KEY` select Russia for CI/CD.
+
+The private `.env` selects `TELEGRAM_LOCAL_API_URL=http://telegram-bot-api:8081`,
+`HTTPS_PROXY=` and `OTEL_EXPORTER_OTLP_ENDPOINT=http://100.64.0.1:4318`.
+The local API uses the existing Finnish reverse proxy route and shared media
+volume. The OTLP endpoint reaches Jaeger through the tailnet-only compatibility
+proxy on server. Default settings remain available for development.
+
+Migration preserves all bot PostgreSQL records. The old bot and database remain
+stopped with `restart=no`; keep their volumes for recovery, but never start a
+second polling bot. Before switching back after new writes, stop Russia and move
+its latest database back. Migration backups are private under
+`/home/maxim/backups/transcriber-migration-20261019` on both hosts and the
+operator's `~/.local/state/transcriber-migration-20261019`.
