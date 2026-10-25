@@ -18,6 +18,7 @@ Telegram bot that transcribes audio and video messages into text using OpenAI Wh
 - Russian language transcription
 - Authorization — only the configured owner can use the bot
 - Async transcription queue — bot replies immediately, edits message when done
+- FIFO replies per chat, including batches of forwarded voice messages
 
 ## Architecture
 
@@ -41,16 +42,29 @@ Telegram API
 User sends audio
        │
        ▼
-Bot downloads → Submit(job) → job_id    ← returns immediately
+"⏳ В очереди..." (reply to original, in Telegram update order)
        │
        ▼
-"⏳ Расшифровываю..." (reply to original)
+Bot downloads → Submit(job) → job_id    ← returns immediately
        │
   [poll every 5s]
        │
        ▼
-Edit message → transcription text
+Wait for earlier replies in this chat → edit message → transcription text
 ```
+
+Within each chat, admission, download/submission and final delivery use FIFO
+queues. At most two files across all chats are being downloaded/uploaded at
+once; additional files wait instead of being rejected. Upload slots are released
+after submission, so the backend can transcribe several jobs concurrently.
+If a later job finishes first, its result waits for earlier messages. Multi-part
+results and lecture files are delivered together before the next final reply.
+Failures and cancellations also advance the delivery queue. Other chats and
+callback buttons remain independent.
+
+The bot's pending uploads and delivery order are held in memory and are lost on
+restart; this change does not add restart recovery. The backend retains its
+existing transcription queue.
 
 ### gRPC API (`proto/whisper.proto`)
 
