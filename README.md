@@ -18,7 +18,7 @@ Telegram bot that transcribes audio and video messages into text using OpenAI Wh
 - Russian language transcription
 - Authorization — only the configured owner can use the bot
 - Async transcription queue — bot replies immediately, edits message when done
-- FIFO replies per chat, including batches of forwarded voice messages
+- Transcription results appear as soon as each job finishes
 
 ## Architecture
 
@@ -50,19 +50,19 @@ Bot downloads → Submit(job) → job_id    ← returns immediately
   [poll every 5s]
        │
        ▼
-Wait for earlier replies in this chat → edit message → transcription text
+Edit message immediately → transcription text
 ```
 
-Within each chat, admission, download/submission and final delivery use FIFO
-queues. At most two files across all chats are being downloaded/uploaded at
+Within each chat, admission and download/submission use FIFO queues.
+At most two files across all chats are being downloaded/uploaded at
 once; additional files wait instead of being rejected. Upload slots are released
 after submission, so the backend can transcribe several jobs concurrently.
-If a later job finishes first, its result waits for earlier messages. Multi-part
-results and lecture files are delivered together before the next final reply.
-Failures and cancellations also advance the delivery queue. Other chats and
-callback buttons remain independent.
+Each result is delivered as soon as polling reports completion, including
+multi-part results and lecture files. Later messages can finish and receive
+their results while earlier jobs are still running. Errors and cancellations
+are also reported immediately. Other chats and callback buttons remain independent.
 
-The bot's pending uploads and delivery order are held in memory and are lost on
+The bot's pending uploads and active job polling are held in memory and are lost on
 restart; this change does not add restart recovery. The backend retains its
 existing transcription queue.
 

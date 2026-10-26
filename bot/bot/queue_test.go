@@ -72,7 +72,6 @@ func TestChatQueuePreservesOrderWithoutBlockingOtherChats(t *testing.T) {
 type batchBackend struct {
 	pb.UnimplementedTranscriptionServiceServer
 	submitted chan string
-	polled    chan string
 	firstDone <-chan struct{}
 	first     *pb.StatusResponse
 }
@@ -98,7 +97,6 @@ func (s *batchBackend) Submit(stream grpc.ClientStreamingServer[pb.TranscribeChu
 }
 
 func (s *batchBackend) GetStatus(_ context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
-	s.polled <- req.JobId
 	if req.JobId == "1" {
 		select {
 		case <-s.firstDone:
@@ -132,7 +130,7 @@ func startBatchBackend(t *testing.T, backend *batchBackend) *whisper.Client {
 	return client
 }
 
-func TestMediaBatchRepliesInOrder(t *testing.T) {
+func TestMediaBatchRepliesAsJobsFinish(t *testing.T) {
 	for _, first := range []struct {
 		name     string
 		response *pb.StatusResponse
@@ -145,7 +143,7 @@ func TestMediaBatchRepliesInOrder(t *testing.T) {
 		t.Run(first.name, func(t *testing.T) {
 			t.Parallel()
 			releaseFirst := make(chan struct{})
-			backend := &batchBackend{submitted: make(chan string, 10), polled: make(chan string, 100), firstDone: releaseFirst, first: first.response}
+			backend := &batchBackend{submitted: make(chan string, 10), firstDone: releaseFirst, first: first.response}
 			client := startBatchBackend(t, backend)
 			files := make(map[string]string)
 			for i := 1; i <= 5; i++ {
@@ -193,18 +191,16 @@ func TestMediaBatchRepliesInOrder(t *testing.T) {
 					t.Fatalf("backend received %q, want %d", got, want)
 				}
 			}
-			// All later jobs finish while the first is still running.
-			ready := make(map[string]bool)
-			for len(ready) < 4 {
-				if job := receive(t, backend.polled); job != "1" {
-					ready[job] = true
-				}
-			}
+			// All later results must reach Telegram while the first job is
+			// still running, without a separate notification about waiting.
 			initial := 0
-			waiting := 0
-			for waiting < 4 {
+			finished := make(map[int]bool)
+			for len(finished) < 4 {
 				r := receive(t, requests)
 				text, _ := r.body["text"].(string)
+				if strings.Contains(text, "ожидаю предыдущие сообщения") {
+					t.Fatalf("unexpected waiting notification: %+v", r)
+				}
 				if r.method == "sendMessage" {
 					initial++
 					if got := int(r.body["reply_parameters"].(map[string]any)["message_id"].(float64)); got != initial {
@@ -212,30 +208,33 @@ func TestMediaBatchRepliesInOrder(t *testing.T) {
 					}
 				}
 				if strings.HasPrefix(text, "<blockquote>") {
-					t.Fatalf("result published before the first job finished: %+v", r)
-				}
-				if text == "⏳ Расшифровка готова, ожидаю предыдущие сообщения..." {
-					waiting++
+					id := int(r.body["message_id"].(float64)) - 100
+					if id < 2 || id > 5 || finished[id] || text != fmt.Sprintf("<blockquote>text %d</blockquote>", id) {
+						t.Fatalf("unexpected early result: %+v", r)
+					}
+					if r.body["reply_markup"] != nil || r.body["parse_mode"] != "HTML" {
+						t.Fatalf("invalid final result formatting: %+v", r)
+					}
+					finished[id] = true
 				}
 			}
 			if initial != 5 {
 				t.Fatalf("initial replies = %d, want 5", initial)
 			}
 			close(releaseFirst)
-			for want := 1; want <= 5; {
+			for {
 				r := receive(t, requests)
 				text, _ := r.body["text"].(string)
+				if strings.Contains(text, "ожидаю предыдущие сообщения") {
+					t.Fatalf("unexpected waiting notification: %+v", r)
+				}
 				if text != first.text && !strings.HasPrefix(text, "<blockquote>") {
 					continue
 				}
-				wantText := fmt.Sprintf("<blockquote>text %d</blockquote>", want)
-				if want == 1 {
-					wantText = first.text
+				if text != first.text || r.body["message_id"] != float64(101) || r.body["reply_markup"] != nil {
+					t.Fatalf("first job's final reply = %+v, want %q on message 101", r, first.text)
 				}
-				if text != wantText || r.body["message_id"] != float64(100+want) {
-					t.Fatalf("final reply %d = %+v, want %q on message %d", want, r, wantText, 100+want)
-				}
-				want++
+				break
 			}
 		})
 	}
@@ -243,6 +242,7 @@ func TestMediaBatchRepliesInOrder(t *testing.T) {
 
 func TestUploadSlotsWaitInsteadOfRejectingFiles(t *testing.T) {
 	started := make(chan struct{}, 3)
+	finals := make(chan string, 3)
 	release := make(chan struct{})
 	var unblock sync.Once
 	defer unblock.Do(func() { close(release) })
@@ -253,57 +253,78 @@ func TestUploadSlotsWaitInsteadOfRejectingFiles(t *testing.T) {
 			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"synthetic download failure"}`)
 			return
 		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		if text, _ := body["text"].(string); strings.HasPrefix(text, "❌") {
+			finals <- text
+		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42,"date":1,"chat":{"id":7,"type":"private"}}}`)
 	})
-	outcomes := make(chan transcriptionOutcome, 3)
+	completed := make(chan struct{}, 3)
 	for i := 1; i <= 3; i++ {
-		go b.processFile(context.Background(), &telego.Message{MessageID: i, Chat: telego.Chat{ID: int64(i)}}, 100+i, "audio", "ogg", "голосовое", "voice", outcomes)
+		go func() {
+			b.processFile(context.Background(), &telego.Message{MessageID: i, Chat: telego.Chat{ID: int64(i)}}, 100+i, "audio", "ogg", "голосовое", "voice")
+			completed <- struct{}{}
+		}()
 	}
 	receive(t, started)
 	receive(t, started)
 	select {
-	case outcome := <-outcomes:
-		t.Fatalf("file rejected while uploads were busy: %+v", outcome)
+	case <-completed:
+		t.Fatal("file rejected while uploads were busy")
 	default:
 	}
 	unblock.Do(func() { close(release) })
 	receive(t, started)
 	for range 3 {
-		if outcome := receive(t, outcomes); !strings.Contains(outcome.text, "Не удалось скачать") {
-			t.Fatalf("expected download attempt, got %+v", outcome)
+		receive(t, completed)
+		if text := receive(t, finals); !strings.Contains(text, "Не удалось скачать") {
+			t.Fatalf("expected download attempt, got %q", text)
 		}
 	}
 }
 
-func TestSubmitFailureProducesDeliveryOutcome(t *testing.T) {
+func TestSubmitFailureEditsStatus(t *testing.T) {
 	backend := &batchBackend{submitted: make(chan string, 1)}
 	client := startBatchBackend(t, backend)
 	path := filepath.Join(t.TempDir(), "audio.ogg")
 	if err := os.WriteFile(path, []byte("submit-error"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	edits := make(chan string, 10)
 	b, _ := fakeTelegram(t, func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/getFile") {
 			json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": map[string]any{"file_id": "audio", "file_path": path}})
 			return
 		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+			return
+		}
+		edits <- body["text"].(string)
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42,"date":1,"chat":{"id":7,"type":"private"}}}`)
 	})
 	b.client = client
-	outcomes := make(chan transcriptionOutcome, 1)
-	b.processFile(context.Background(), &telego.Message{Chat: telego.Chat{ID: 7}}, 42, "audio", "ogg", "голосовое", "voice", outcomes)
-	if outcome := receive(t, outcomes); outcome.text != "Произошла ошибка при отправке на расшифровку." {
-		t.Fatalf("submit failure outcome = %+v", outcome)
+	b.processFile(context.Background(), &telego.Message{Chat: telego.Chat{ID: 7}}, 42, "audio", "ogg", "голосовое", "voice")
+	var final string
+	for len(edits) > 0 {
+		final = <-edits
+	}
+	if final != "Произошла ошибка при отправке на расшифровку." {
+		t.Fatalf("submit failure status = %q", final)
 	}
 }
 
-func TestLocalCancellationProducesDeliveryOutcome(t *testing.T) {
+func TestLocalCancellationEditsStatus(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	var b Bot
-	outcomes := make(chan transcriptionOutcome, 1)
-	b.pollAndUpdate(ctx, cancel, &telego.Message{Chat: telego.Chat{ID: 7}}, 42, "cancelled-job", outcomes)
-	if outcome := receive(t, outcomes); outcome.text != "❌ Отменено." {
-		t.Fatalf("cancelled poll outcome = %+v", outcome)
+	b, requests := fakeTelegram(t, nil)
+	b.pollAndUpdate(ctx, cancel, &telego.Message{Chat: telego.Chat{ID: 7}}, 42, "cancelled-job", "voice")
+	if r := receive(t, requests); r.method != "editMessageText" || r.body["text"] != "❌ Отменено." || r.body["reply_markup"] != nil {
+		t.Fatalf("cancelled poll status = %+v", r)
 	}
 }

@@ -43,9 +43,8 @@ type Bot struct {
 	userPreset  sync.Map // userID → preset name (string)
 	uploadSlots chan struct{}
 
-	messages   chatQueue
-	uploads    chatQueue
-	deliveries chatQueue
+	messages chatQueue
+	uploads  chatQueue
 
 	processedMsgs sync.Map // chatID:messageID → time.Time
 }
@@ -324,14 +323,8 @@ func (b *Bot) handle(ctx context.Context, update telego.Update) {
 		return
 	}
 
-	// Register delivery before starting the upload: backend workers may finish
-	// later messages first, but all terminal replies must keep admission order.
-	outcome := make(chan transcriptionOutcome, 1)
-	b.deliveries.enqueue(msg.Chat.ID, func() {
-		b.deliverOutcome(msg, statusMsg.MessageID, effectivePreset, <-outcome)
-	})
 	b.uploads.enqueue(msg.Chat.ID, func() {
-		b.processFile(ctx, msg, statusMsg.MessageID, fileID, format, noun, effectivePreset, outcome)
+		b.processFile(ctx, msg, statusMsg.MessageID, fileID, format, noun, effectivePreset)
 	})
 }
 
@@ -388,7 +381,7 @@ func (b *Bot) sendPresetKeyboard(msg *telego.Message) {
 }
 
 // pollAndUpdate periodically polls the job status and edits the status message when done.
-func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *telego.Message, statusMsgID int, jobID string, outcome chan<- transcriptionOutcome) {
+func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, origMsg *telego.Message, statusMsgID int, jobID, preset string) {
 	defer func() {
 		cancel()
 		b.cancels.Delete(jobID)
@@ -406,15 +399,15 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 		select {
 		case <-ctx.Done():
 			slog.InfoContext(ctx, "job cancelled", "job_id", jobID)
-			outcome <- transcriptionOutcome{text: "❌ Отменено."}
+			b.editFinal(origMsg.Chat.ID, statusMsgID, "❌ Отменено.")
 			return
 		case <-deadline:
 			slog.WarnContext(ctx, "poll deadline exceeded", "job_id", jobID)
-			outcome <- transcriptionOutcome{text: "Превышено время ожидания (3 часа). Попробуй ещё раз."}
+			b.editFinal(origMsg.Chat.ID, statusMsgID, "Превышено время ожидания (3 часа). Попробуй ещё раз.")
 			return
 		case <-ticker.C:
 			if ctx.Err() != nil {
-				outcome <- transcriptionOutcome{text: "❌ Отменено."}
+				b.editFinal(origMsg.Chat.ID, statusMsgID, "❌ Отменено.")
 				return
 			}
 			result, err := b.client.GetStatusContext(ctx, jobID)
@@ -445,35 +438,25 @@ func (b *Bot) pollAndUpdate(ctx context.Context, cancel context.CancelFunc, orig
 				}
 			case pb.JobStatus_DONE:
 				slog.InfoContext(ctx, "job done", "job_id", jobID, "text_runes", len([]rune(result.Text)))
-				b.edit(origMsg.Chat.ID, statusMsgID, resources.WaitingForEarlier, nil)
-				outcome <- transcriptionOutcome{result: result}
+				b.deliverResult(origMsg, statusMsgID, preset, result)
 				return
 			case pb.JobStatus_FAILED:
 				if result.Error == "cancelled" {
-					outcome <- transcriptionOutcome{text: "❌ Отменено."}
+					b.editFinal(origMsg.Chat.ID, statusMsgID, "❌ Отменено.")
 					return
 				}
 				slog.ErrorContext(ctx, "job failed", "job_id", jobID, "error", result.Error)
-				outcome <- transcriptionOutcome{text: "Произошла ошибка при расшифровке."}
+				b.editFinal(origMsg.Chat.ID, statusMsgID, "Произошла ошибка при расшифровке.")
 				return
 			}
 		}
 	}
 }
 
-type transcriptionOutcome struct {
-	text   string
-	result *whisper.JobResult
-}
-
-// deliverOutcome publishes the whole result together, including extra text
-// parts or a lecture file, before allowing the next message's final reply.
-func (b *Bot) deliverOutcome(msg *telego.Message, statusMsgID int, preset string, outcome transcriptionOutcome) {
-	if outcome.result == nil {
-		b.editFinal(msg.Chat.ID, statusMsgID, outcome.text)
-		return
-	}
-	text := formatResult(outcome.result, preset)
+// deliverResult publishes a completed transcription without waiting for other
+// jobs in the chat, including extra text parts or a lecture file.
+func (b *Bot) deliverResult(msg *telego.Message, statusMsgID int, preset string, result *whisper.JobResult) {
+	text := formatResult(result, preset)
 	if text == "" {
 		text = "(тишина)"
 	}
@@ -693,12 +676,12 @@ func (b *Bot) sendInitialStatus(ctx context.Context, msg *telego.Message, noun s
 	return statusMsg, nil
 }
 
-func (b *Bot) processFile(ctx context.Context, msg *telego.Message, statusMsgID int, fileID, format, noun, preset string, outcome chan<- transcriptionOutcome) {
+func (b *Bot) processFile(ctx context.Context, msg *telego.Message, statusMsgID int, fileID, format, noun, preset string) {
 	select {
 	case b.uploadSlots <- struct{}{}:
 		defer func() { <-b.uploadSlots }()
 	case <-ctx.Done():
-		outcome <- transcriptionOutcome{text: "❌ Отменено."}
+		b.editFinal(msg.Chat.ID, statusMsgID, "❌ Отменено.")
 		return
 	}
 
@@ -722,7 +705,7 @@ func (b *Bot) processFile(ctx context.Context, msg *telego.Message, statusMsgID 
 	})
 	if err != nil {
 		slog.ErrorContext(ctx, "download file", "error", err)
-		outcome <- transcriptionOutcome{text: "❌ Не удалось скачать " + noun + ". Попробуй ещё раз позже."}
+		b.editFinal(msg.Chat.ID, statusMsgID, "❌ Не удалось скачать "+noun+". Попробуй ещё раз позже.")
 		return
 	}
 	defer rc.Close()
@@ -733,10 +716,10 @@ func (b *Bot) processFile(ctx context.Context, msg *telego.Message, statusMsgID 
 	jobID, queuePos, err := b.client.SubmitContext(ctx, rc, format, opts)
 	if err != nil {
 		if _, ok := errors.AsType[*whisper.UnavailableError](err); ok {
-			outcome <- transcriptionOutcome{text: "Сервис транскрипции недоступен, попробуй позже."}
+			b.editFinal(msg.Chat.ID, statusMsgID, "Сервис транскрипции недоступен, попробуй позже.")
 		} else {
 			slog.ErrorContext(ctx, "submit job", "error", err)
-			outcome <- transcriptionOutcome{text: "Произошла ошибка при отправке на расшифровку."}
+			b.editFinal(msg.Chat.ID, statusMsgID, "Произошла ошибка при отправке на расшифровку.")
 		}
 		return
 	}
@@ -753,7 +736,7 @@ func (b *Bot) processFile(ctx context.Context, msg *telego.Message, statusMsgID 
 	keyboard := cancelKeyboard(jobID)
 	b.edit(msg.Chat.ID, statusMsgID, statusText, keyboard)
 
-	go b.pollAndUpdate(jobCtx, cancel, msg, statusMsgID, jobID, outcome)
+	go b.pollAndUpdate(jobCtx, cancel, msg, statusMsgID, jobID, preset)
 }
 
 func (b *Bot) sendAsFile(orig *telego.Message, text string, replyToID int) {
