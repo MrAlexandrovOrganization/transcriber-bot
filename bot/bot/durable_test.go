@@ -739,3 +739,55 @@ func TestMissingRetainedJobBecomesDurableErrorInsteadOfHanging(t *testing.T) {
 		t.Fatal("missing result was not reported durably")
 	}
 }
+
+func TestRunContextWaitsForPreviousPollerAndResumes(t *testing.T) {
+	dsn := testdb.New(t)
+	called := make(chan struct{}, 1)
+	b, _ := fakeTelegram(t, func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/getUpdates") {
+			io.Copy(io.Discard, r.Body)
+			select {
+			case called <- struct{}{}:
+			default:
+			}
+			<-r.Context().Done()
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+	})
+	b.chats = openBotStore(t, dsn)
+	previous, err := b.chats.OpenPoller(context.Background(), b.botID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- b.RunContext(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("poller shutdown stalled")
+		}
+	})
+	select {
+	case <-called:
+		previous.Close()
+		t.Fatal("polled Telegram while previous owner was still live")
+	case err := <-done:
+		previous.Close()
+		done <- err
+		t.Fatal("ownership contention stopped bot", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	previous.Close()
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replacement did not resume after previous session closed")
+	}
+}

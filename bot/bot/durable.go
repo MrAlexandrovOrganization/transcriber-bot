@@ -41,8 +41,17 @@ func (b *Bot) RunContext(parent context.Context) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	poller, err := b.chats.OpenPoller(ctx, b.botID)
+	if errors.Is(err, store.ErrPollerOwned) {
+		slog.Warn("waiting for previous poller database session")
+	}
+	for errors.Is(err, store.ErrPollerOwned) {
+		if !wait(ctx, 3*time.Second) {
+			return nil
+		}
+		poller, err = b.chats.OpenPoller(ctx, b.botID)
+	}
 	if err != nil {
-		return err
+		return errors.New("poller database unavailable")
 	}
 	defer poller.Close()
 	var workers sync.WaitGroup

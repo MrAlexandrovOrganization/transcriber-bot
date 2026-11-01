@@ -100,6 +100,45 @@ func TestCursorAtomicityAndPollerOwnership(t *testing.T) {
 		t.Fatal("duplicate update persisted twice")
 	}
 }
+
+func TestAbandonedPollerSessionExpiresWithoutLeakingTimeoutToWorkers(t *testing.T) {
+	s := openStore(t, testdb.New(t))
+	ctx := context.Background()
+	p, err := s.OpenPoller(ctx, testBotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	var timeout string
+	if err = p.conn.QueryRow(ctx, "SHOW idle_session_timeout").Scan(&timeout); err != nil || timeout != "2min" {
+		t.Fatalf("poller idle limit: %q %v", timeout, err)
+	}
+	if _, err = s.OpenPoller(ctx, testBotID); !errors.Is(err, ErrPollerOwned) {
+		t.Fatalf("live poller ownership was bypassed: %v", err)
+	}
+	// Simulate a frozen/disconnected process with a shorter server-side limit.
+	if _, err = p.conn.Exec(ctx, "SET idle_session_timeout='1s'"); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		replacement, err := s.OpenPoller(ctx, testBotID)
+		if err == nil {
+			replacement.Close()
+			break
+		}
+		if !errors.Is(err, ErrPollerOwned) || time.Now().After(deadline) {
+			t.Fatalf("abandoned poller did not release ownership: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err = p.Accept(ctx, []Update{{1, json.RawMessage(`{}`)}}, 2); err == nil {
+		t.Fatal("expired poller could still commit updates")
+	}
+	if err = s.pool.QueryRow(ctx, "SHOW idle_session_timeout").Scan(&timeout); err != nil || timeout != "0" {
+		t.Fatalf("poller timeout leaked into worker pool: %q %v", timeout, err)
+	}
+}
 func TestAdmissionFailureCannotConsumeInbox(t *testing.T) {
 	s := openStore(t, testdb.New(t))
 	ctx := context.Background()

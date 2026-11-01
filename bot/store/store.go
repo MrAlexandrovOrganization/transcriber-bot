@@ -39,6 +39,9 @@ func openWithRetry(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 		cfg.MaxConns = max(cfg.MaxConns, 12)
 		cfg.ConnConfig.ConnectTimeout = 3 * time.Second
 		cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
+		cfg.ConnConfig.RuntimeParams["tcp_keepalives_idle"] = "30"
+		cfg.ConnConfig.RuntimeParams["tcp_keepalives_interval"] = "10"
+		cfg.ConnConfig.RuntimeParams["tcp_keepalives_count"] = "3"
 		pool, err := pgxpool.NewWithConfig(ctx, cfg)
 		if err == nil {
 			pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)

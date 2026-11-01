@@ -49,9 +49,10 @@ func unlock(conn *pgxpool.Conn, key string) {
 
 type Poller struct {
 	conn  *pgxpool.Conn
-	key   string
 	botID int64
 }
+
+var ErrPollerOwned = errors.New("another bot poller owns this database")
 
 func (s *Store) OpenPoller(ctx context.Context, botID int64) (*Poller, error) {
 	key := fmt.Sprintf("transcriber-bot:poller:%d", botID)
@@ -60,16 +61,27 @@ func (s *Store) OpenPoller(ctx context.Context, botID int64) (*Poller, error) {
 		return nil, err
 	}
 	if !ok {
-		return nil, errors.New("another bot poller owns this database")
+		return nil, ErrPollerOwned
 	}
-	p := &Poller{conn: conn, key: key, botID: botID}
+	p := &Poller{conn: conn, botID: botID}
+	// A dead TCP peer can otherwise retain this session lock for hours. Only the
+	// poller gets an idle limit: downloads legitimately hold job locks much longer.
+	if _, err = conn.Exec(ctx, query("poller_settings")); err != nil {
+		p.Close()
+		return nil, err
+	}
 	if _, err = conn.Exec(ctx, query("cursor_init"), botID); err != nil {
 		p.Close()
 		return nil, err
 	}
 	return p, nil
 }
-func (p *Poller) Close() { unlock(p.conn, p.key) }
+func (p *Poller) Close() {
+	// Never put this session's idle timeout back into the general worker pool.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = p.conn.Hijack().Close(ctx)
+}
 func (p *Poller) Cursor(ctx context.Context) (int, error) {
 	var offset int
 	err := p.conn.QueryRow(ctx, query("cursor_read"), p.botID).Scan(&offset)

@@ -77,7 +77,7 @@ func main() {
 
 	slog.Info("bot started")
 	if err := b.RunContext(ctx); err != nil {
-		slog.Error("durable bot stopped")
+		slog.Error("durable bot stopped", "reason", err)
 		os.Exit(1)
 	}
 }

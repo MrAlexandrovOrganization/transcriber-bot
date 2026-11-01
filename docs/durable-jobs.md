@@ -40,6 +40,11 @@ the already completed result rather than claim a successful cancellation.
   database state is written through that very connection. Connection loss fences
   old writes. Locks release automatically on a crash. No transaction stays open
   while waiting for Telegram, downloads or inference.
+  The dedicated poller session expires after 120 seconds of database inactivity
+  (Telegram requests have a 70-second HTTP deadline). A replacement waits for
+  existing ownership instead of entering a restart loop. TCP keepalives bound
+  detection of disconnected database clients; worker sessions have no idle limit
+  because downloading a large file can take much longer.
 - Status and upload stages remain FIFO per chat. Two workers per stage are
   bounded; only two upload workers download/submit media. Polling and delivery
   can overtake an earlier running job. The database pool has at least twelve
