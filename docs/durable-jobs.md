@@ -68,7 +68,9 @@ the already completed result rather than claim a successful cancellation.
 ## Migrations, rollout and rollback
 
 Ordered SQL files live under `bot/store/sql/migrations`. A transaction and advisory
-lock protect the migration ledger. The baseline adopts the existing chats table;
+lock protect the migration ledger. Startup migration has a two-minute overall
+budget, a 60-second per-statement timeout and a 30-second lock timeout; these
+transaction-local settings do not change the five-second normal query budget. The baseline adopts the existing chats table;
 new tables are additive. Applied migrations must not be edited. Startup applies
 migrations to preserve this project's established deployment contract. Explicit
 application is also available via `DATABASE_URL=... make migrate` or the running

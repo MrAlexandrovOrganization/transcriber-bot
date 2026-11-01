@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"transcriber-bot/internal/testdb"
 )
 
@@ -257,5 +258,56 @@ func TestMigrationPreservesLegacyChatsAndIsRepeatable(t *testing.T) {
 	var count int
 	if err = conn.QueryRow(ctx, "SELECT COUNT(*) FROM bot_schema_migrations").Scan(&count); err != nil || count != 2 {
 		t.Fatal(count, err)
+	}
+}
+
+func TestSlowDDLHasSeparateBoundedMigrationBudget(t *testing.T) {
+	dsn := testdb.New(t)
+	ctx := context.Background()
+	admin, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Close(ctx)
+	var schema string
+	if err = admin.QueryRow(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
+		t.Fatal(err)
+	}
+	trigger := pgx.Identifier{schema + "_slow_ddl"}.Sanitize()
+	// Delay only this test's migration pool; other tests may share the database.
+	_, err = admin.Exec(ctx, `CREATE FUNCTION delay_ledger_ddl() RETURNS event_trigger LANGUAGE plpgsql AS $$
+ BEGIN
+  IF current_setting('application_name')='a03_slow_migration' AND position('bot_schema_migrations' IN current_query())>0 THEN
+   PERFORM pg_sleep(6);
+  END IF;
+ END $$;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = admin.Exec(ctx, "CREATE EVENT TRIGGER "+trigger+" ON ddl_command_start WHEN TAG IN ('CREATE TABLE') EXECUTE FUNCTION delay_ledger_ddl()"); err != nil {
+		t.Fatal(err)
+	}
+	defer admin.Exec(ctx, "DROP EVENT TRIGGER "+trigger)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConnConfig.RuntimeParams["application_name"] = "a03_slow_migration"
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err = migrate(ctx, pool); err != nil {
+		t.Fatalf("slow startup DDL incorrectly used ordinary query timeout: %v", err)
+	}
+	var count int
+	if err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM bot_schema_migrations").Scan(&count); err != nil || count != 2 {
+		t.Fatal("migration did not commit", count, err)
+	}
+	var timeout string
+	if err = pool.QueryRow(ctx, "SHOW statement_timeout").Scan(&timeout); err != nil || timeout != "5s" {
+		t.Fatal("migration timeout leaked to ordinary queries", timeout, err)
 	}
 }

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -9,11 +10,16 @@ import (
 // Startup migration preserves this application's existing deployment contract.
 // Ordered SQL migrations and their ledger commit together under an advisory lock.
 func migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, query("migrate_settings")); err != nil {
+		return err
+	}
 	if _, err = tx.Exec(ctx, query("migrate_lock")); err != nil {
 		return err
 	}
