@@ -2,7 +2,10 @@ package whisper
 
 import (
 	"bytes"
+	"context"
 	"errors"
+	"google.golang.org/grpc"
+	"net"
 	"testing"
 
 	"google.golang.org/grpc/codes"
@@ -150,5 +153,41 @@ func TestWrapErr_NonGRPCError(t *testing.T) {
 	var unavail *UnavailableError
 	if errors.As(err, &unavail) {
 		t.Errorf("plain error should not wrap as UnavailableError")
+	}
+}
+
+type earlyReplyBackend struct {
+	pb.UnimplementedTranscriptionServiceServer
+}
+
+func (earlyReplyBackend) Submit(stream grpc.ClientStreamingServer[pb.TranscribeChunk, pb.SubmitResponse]) error {
+	first, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if first.RequestId != "transcriber-bot:synthetic-replay" || !first.RetainUntilAck {
+		return status.Error(codes.InvalidArgument, "missing durable identity")
+	}
+	// A replayed backend returns the persisted response before reading all audio.
+	return stream.SendAndClose(&pb.SubmitResponse{JobId: "persisted-job"})
+}
+func TestDurableSubmitAcceptsEarlyReplayResponse(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	pb.RegisterTranscriptionServiceServer(server, earlyReplyBackend{})
+	go server.Serve(listener)
+	defer server.Stop()
+	host, port, _ := net.SplitHostPort(listener.Addr().String())
+	client, err := NewClient(host, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	id, _, err := client.SubmitDurable(context.Background(), bytes.NewReader(make([]byte, 8*chunkSize)), "ogg", nil, "transcriber-bot:synthetic-replay")
+	if err != nil || id != "persisted-job" {
+		t.Fatalf("early replay response lost: id=%q err=%v", id, err)
 	}
 }

@@ -1,5 +1,4 @@
-// Package store persists the allowlist of group chats where the bot is
-// allowed to transcribe messages.
+// Package store persists group authorization and the durable intake/job/outbox lifecycle.
 package store
 
 import (
@@ -10,14 +9,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS chats (
-	chat_id  BIGINT PRIMARY KEY,
-	title    TEXT        NOT NULL DEFAULT '',
-	added_by BIGINT      NOT NULL,
-	added_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);`
 
 type Store struct {
 	pool *pgxpool.Pool
@@ -30,7 +21,7 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err := pool.Exec(ctx, schema); err != nil {
+	if err := migrate(ctx, pool); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
@@ -39,12 +30,15 @@ func New(ctx context.Context, dsn string) (*Store, error) {
 
 func openWithRetry(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 	const attempts = 10
-	var lastErr error
+
 	for i := 1; i <= attempts; i++ {
 		cfg, err := pgxpool.ParseConfig(dsn)
 		if err != nil {
-			return nil, fmt.Errorf("parse dsn: %w", err)
+			return nil, fmt.Errorf("invalid database configuration")
 		}
+		cfg.MaxConns = max(cfg.MaxConns, 12)
+		cfg.ConnConfig.ConnectTimeout = 3 * time.Second
+		cfg.ConnConfig.RuntimeParams["statement_timeout"] = "5000"
 		pool, err := pgxpool.NewWithConfig(ctx, cfg)
 		if err == nil {
 			pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -55,23 +49,21 @@ func openWithRetry(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
 			}
 			pool.Close()
 		}
-		lastErr = err
-		slog.Warn("postgres not ready, retrying", "attempt", i, "error", err)
+		slog.Warn("postgres not ready, retrying", "attempt", i)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-time.After(3 * time.Second):
 		}
 	}
-	return nil, fmt.Errorf("connect postgres after %d attempts: %w", attempts, lastErr)
+	return nil, fmt.Errorf("connect postgres after %d attempts failed", attempts)
 }
 
 // Add inserts the chat into the allowlist.
 // Returns true if the chat was not present before.
 func (s *Store) Add(ctx context.Context, chatID int64, title string, addedBy int64) (bool, error) {
 	tag, err := s.pool.Exec(ctx,
-		`INSERT INTO chats (chat_id, title, added_by) VALUES ($1, $2, $3)
-		 ON CONFLICT DO NOTHING`,
+		query("chat_add"),
 		chatID, title, addedBy,
 	)
 	if err != nil {
@@ -82,7 +74,7 @@ func (s *Store) Add(ctx context.Context, chatID int64, title string, addedBy int
 
 // Remove deletes the chat from the allowlist.
 func (s *Store) Remove(ctx context.Context, chatID int64) error {
-	if _, err := s.pool.Exec(ctx, `DELETE FROM chats WHERE chat_id = $1`, chatID); err != nil {
+	if _, err := s.pool.Exec(ctx, query("chat_remove"), chatID); err != nil {
 		return fmt.Errorf("remove chat %d: %w", chatID, err)
 	}
 	return nil
@@ -92,7 +84,7 @@ func (s *Store) Remove(ctx context.Context, chatID int64) error {
 func (s *Store) Exists(ctx context.Context, chatID int64) (bool, error) {
 	var ok bool
 	err := s.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM chats WHERE chat_id = $1)`, chatID,
+		query("chat_exists"), chatID,
 	).Scan(&ok)
 	if err != nil {
 		return false, fmt.Errorf("check chat %d: %w", chatID, err)

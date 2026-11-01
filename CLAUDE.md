@@ -13,10 +13,10 @@ The Whisper backend lives in a separate project: `backends/transcriber`.
 | File | Purpose |
 |------|---------|
 | `bot/bot/handler.go` | Telegram handlers — voice, video, document messages; async poll loop |
-| `bot/store/store.go` | Postgres allowlist of group chats (Add/Remove/Exists, auto-migrate) |
+| `bot/store/store.go` | Postgres allowlist, durable inbox/jobs/outbox and ordered migrations |
 | `bot/whisper/client.go` | gRPC client — Submit (async) + GetStatus |
 | `bot/config/config.go` | Loads env vars, validates `BOT_TOKEN`, `ROOT_ID`, `DATABASE_URL` |
-| `proto/whisper.proto` | gRPC service definition — source of truth for all clients |
+| `proto/whisper.proto` | Pinned snapshot of canonical backend contract |
 | `compose/docker-compose.yml` | Bot + postgres + telegram-bot-api services (requires external `whisper-net`) |
 | `Makefile` | All dev and deploy commands |
 
@@ -39,7 +39,7 @@ make proto         # regenerate Go stubs (local dev only, Docker builds them)
 - Whisper is a **standalone shared service** on Docker network `whisper-net` — not published to host
 - Bot submits audio via `Submit` RPC → gets `job_id` immediately → polls `GetStatus` every 5s
 - Bot replies to the original message with status, edits it when done
-- `pollDeadline = 3h`, `pollInterval = 5s`
+- Durable retries have no three-hour drop deadline; polling interval is 5s
 - gRPC max message size: **50MB**; Telegram local API handles files up to **2GB**
 - Bot uses **polling** (not webhooks)
 - Authorization: private chats — only `ROOT_ID`; groups — chat must be in the Postgres allowlist
@@ -50,7 +50,7 @@ make proto         # regenerate Go stubs (local dev only, Docker builds them)
 
 ## Proto / gRPC API
 
-`proto/whisper.proto` is the source of truth for all clients connecting to the shared whisper service.
+Canonical proto belongs to the backend; `proto/source.json` pins this snapshot. `make proto-sync` explicitly downloads that revision; ordinary generation/build/check never sync from a neighbor or network.
 
 | RPC | Type | Description |
 |-----|------|-------------|
@@ -61,7 +61,7 @@ make proto         # regenerate Go stubs (local dev only, Docker builds them)
 When changing `proto/whisper.proto`, regenerate stubs:
 
 ```bash
-make proto   # Go stubs (also regenerated in bot/Dockerfile)
+make proto-gen # Go stubs (Docker uses the same Make target)
 ```
 
 Generated files — do not edit manually:
@@ -84,3 +84,5 @@ Optional (set in compose):
 - `whisper-net` must exist and Whisper service must be running before `make up`
 - Large files require `telegram-bot-api` service; without it Telegram limits downloads to ~20MB
 - Go stubs in `bot/gen/whisper/` are intentionally empty in the repo — generated at Docker build time
+
+Durable lifecycle, guarantees and rollout: docs/durable-jobs.md. Versions live in makefiles/versions.mk. CI must run PostgreSQL integration and race tests.

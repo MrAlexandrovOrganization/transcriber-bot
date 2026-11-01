@@ -1,0 +1,1 @@
+UPDATE transcription_jobs SET state='done',updated_at=now() WHERE bot_id=$1 AND update_id=$2 AND acknowledged AND NOT EXISTS(SELECT 1 FROM transcription_deliveries d WHERE d.bot_id=$1 AND d.update_id=$2 AND NOT delivered);

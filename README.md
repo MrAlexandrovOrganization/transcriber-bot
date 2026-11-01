@@ -3,7 +3,7 @@
 ## Build versions
 
 Go and protoc-gen-go come from `bot/go.mod`; remaining tools and images live
-in `versions.mk`. `make versions` prints values, `make install` installs the
+in `makefiles/versions.mk`. `make versions` prints values, `make install` installs the
 pinned tools, and `make compose-build` builds images with Make-provided args.
 CI reads Go from `bot/go.mod`. Re-run installation after changing tool versions.
 
@@ -14,9 +14,9 @@ Telegram bot that transcribes audio and video messages into text using OpenAI Wh
 - Voice messages (OGG)
 - Video notes / circles (MP4)
 - Regular videos (MP4)
-- Large video files sent as documents (up to 2GB via local Telegram Bot API)
+- Documents via local Telegram Bot API; transcription limit defaults to 256 MiB (A10)
 - Russian language transcription
-- Authorization — only the configured owner can use the bot
+- Authorization — owner in private chats; existing allowlisted-group policy remains supported
 - Async transcription queue — bot replies immediately, edits message when done
 - Transcription results appear as soon as each job finishes
 
@@ -53,18 +53,24 @@ Bot downloads → Submit(job) → job_id    ← returns immediately
 Edit message immediately → transcription text
 ```
 
-Within each chat, admission and download/submission use FIFO queues.
-At most two files across all chats are being downloaded/uploaded at
-once; additional files wait instead of being rejected. Upload slots are released
-after submission, so the backend can transcribe several jobs concurrently.
-Each result is delivered as soon as polling reports completion, including
-multi-part results and lecture files. Later messages can finish and receive
-their results while earlier jobs are still running. Errors and cancellations
-are also reported immediately. Other chats and callback buttons remain independent.
+Updates and their polling offset commit atomically to PostgreSQL before the
+next `getUpdates` call acknowledges them. Authorized media becomes a durable job
+with a stable request ID, source chat/message, file ID and resolved preset.
+Status messages and uploads keep FIFO order within each chat. At most two
+uploads run across all chats. Later completed jobs are delivered immediately,
+without waiting for earlier transcriptions.
 
-The bot's pending uploads and active job polling are held in memory and are lost on
-restart; this change does not add restart recovery. The backend retains its
-existing transcription queue.
+Pending admission, uploads, status polling, cancellation, backend Ack and every
+result delivery part resume after restart. Results and their delivery outbox
+commit locally **before backend Ack**. Confirmed Telegram parts are not resent.
+Temporary failures retry with bounded backoff (and Telegram `retry_after`).
+See [durable processing, guarantees and rollout](docs/durable-jobs.md).
+
+Telegram send methods have no caller-supplied idempotency key. A crash or lost
+response after a successful send but before the local receipt can duplicate that
+unconfirmed message/document. This implementation provides at-least-once
+sending, with idempotent edits and persisted receipts; it does not promise
+exactly-once Telegram delivery.
 
 ### gRPC API (`proto/whisper.proto`)
 
@@ -73,11 +79,14 @@ existing transcription queue.
 | `Transcribe` | client-streaming (legacy) | Blocks until done |
 | `Submit` | client-streaming | Returns `job_id` immediately |
 | `GetStatus` | unary | Returns job status and text |
+| `Ack` | unary | Confirms durable local receipt of a terminal result |
 
 ## Prerequisites
 
 - Docker & Docker Compose
 - Go from `bot/go.mod` for local development, Docker and CI
+- Python 3 for offline snapshot verification; authenticated GitHub CLI only for explicit proto-sync
+- Isolated PostgreSQL for integration tests (CI provisions the pinned Docker image)
 - Whisper backend running (see [backends/transcriber](../backends/transcriber))
 
 The Telegram client uses `github.com/mymmrac/telego` v1.12.1 with long polling.
@@ -87,15 +96,16 @@ downloaded files are read from the shared filesystem as before.
 ## Development checks
 
 ```bash
-make install     # Install pinned buf/protobuf tools into Go's bin directory
+make install     # Install pinned buf/protobuf tools into project .bin/
 make proto-gen   # Generate stubs from the checked-in proto, no backend checkout needed
 make check       # Formatting, proto lint, unit tests and go vet
 make test-race   # Run tests with the race detector
+make test-integration # Requires TRANSCRIBER_BOT_TEST_DATABASE_URL, synthetic DB only
 make build       # Build all Go packages
 ```
 
 Make selects the Go toolchain from `bot/go.mod` (downloaded automatically if needed).
-Ensure `$(go env GOPATH)/bin` is on PATH for tools installed by `make install`.
+Tools installed by `make install` live in the ignored project `.bin/` directory.
 Telegram integration tests use a local fake API and synthetic tokens.
 
 ## Setup
@@ -128,7 +138,7 @@ TELEGRAM_API_HASH=<Telegram API hash>
 ## Running
 
 ```bash
-make up       # Build and start bot services
+make up       # Generate from pinned local snapshot, build and start bot services
 make down     # Stop bot services
 make logs     # Follow bot logs
 make restart  # Restart without rebuild
@@ -154,7 +164,8 @@ make proto    # Regenerate Go gRPC stubs (local dev only)
 ```
 .
 ├── proto/
-│   └── whisper.proto              # gRPC service definition (source of truth)
+│   ├── whisper.proto              # Pinned backend contract snapshot
+│   └── source.json                # Canonical revision and checksum
 ├── bot/                           # Go bot
 │   ├── main.go
 │   ├── bot/handler.go             # Telegram message handlers

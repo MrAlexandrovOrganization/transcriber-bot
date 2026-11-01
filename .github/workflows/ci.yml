@@ -34,6 +34,18 @@ jobs:
       - name: Check
         run: make check
 
+      - name: Start isolated PostgreSQL
+        run: make test-db-up
+
+      - name: Durable restart, delivery and race tests
+        run: make test-integration test-race
+        env:
+          TRANSCRIBER_BOT_TEST_DATABASE_URL: postgresql://pilot:synthetic-ci-password@127.0.0.1:55440/transcriber_bot_test
+
+      - name: Stop isolated PostgreSQL
+        if: always()
+        run: make test-db-down
+
       - name: Build
         run: make build
 

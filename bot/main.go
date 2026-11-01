@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"transcriber-bot/bot"
@@ -15,6 +17,8 @@ import (
 )
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 	// JSON logs on stdout with a "service" attribute, LOG_LEVEL support,
 	// and masking of the bot token in all log records.
 	logx.Setup("transcriber-bot", os.Getenv("BOT_TOKEN"))
@@ -31,6 +35,20 @@ func main() {
 		}
 	}()
 
+	// Migration CLI needs only DATABASE_URL, never Telegram credentials or polling.
+	if len(os.Args) == 2 && os.Args[1] == "migrate" {
+		if os.Getenv("DATABASE_URL") == "" {
+			slog.Error("DATABASE_URL is required for migrate")
+			os.Exit(1)
+		}
+		database, err := store.New(ctx, os.Getenv("DATABASE_URL"))
+		if err != nil {
+			slog.Error("schema migration failed")
+			os.Exit(1)
+		}
+		database.Close()
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		slog.Error("config", "error", err)
@@ -44,7 +62,7 @@ func main() {
 	}
 	defer wc.Close()
 
-	chats, err := store.New(context.Background(), cfg.DatabaseURL)
+	chats, err := store.New(ctx, cfg.DatabaseURL)
 	if err != nil {
 		slog.Error("chat store", "error", err)
 		os.Exit(1)
@@ -58,5 +76,8 @@ func main() {
 	}
 
 	slog.Info("bot started")
-	b.Run()
+	if err := b.RunContext(ctx); err != nil {
+		slog.Error("durable bot stopped")
+		os.Exit(1)
+	}
 }

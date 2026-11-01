@@ -11,3 +11,10 @@ to-transcribe
 .env.*
 **/.env
 **/.env.*
+
+.bin
+.build
+bot/gen
+**/*_test.go
+**/__pycache__
+.DS_Store

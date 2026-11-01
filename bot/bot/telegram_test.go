@@ -16,6 +16,7 @@ import (
 	"github.com/mymmrac/telego"
 
 	"transcriber-bot/config"
+	"transcriber-bot/store"
 )
 
 const testToken = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
@@ -88,12 +89,12 @@ func TestTelegramMessagesAndKeyboards(t *testing.T) {
 	if r.body["text"] != "<blockquote>Расшифровка &lt;текста&gt;</blockquote>" || r.body["parse_mode"] != "HTML" {
 		t.Fatalf("unexpected quoted edit: %+v", r)
 	}
-	b.replyToHTML(msg, quoteText("часть 2"))
+	b.replyToHTML(context.Background(), msg, quoteText("часть 2"))
 	r = <-requests
 	if r.method != "sendMessage" || r.body["text"] != "<blockquote>часть 2</blockquote>" {
 		t.Fatalf("unexpected quoted reply: %+v", r)
 	}
-	b.sendPresetKeyboard(msg)
+	b.sendPresetKeyboard(context.Background(), msg)
 	r = <-requests
 	if r.method != "sendMessage" || r.body["reply_markup"] == nil {
 		t.Fatalf("unexpected preset keyboard: %+v", r)
@@ -151,7 +152,9 @@ func TestTelegramLectureUpload(t *testing.T) {
 		}
 		fmt.Fprint(w, `{"ok":true,"result":{"message_id":42,"date":1,"chat":{"id":7,"type":"private"}}}`)
 	})
-	b.sendAsFile(&telego.Message{MessageID: 10, Chat: telego.Chat{ID: 7}}, "Текст лекции", 10)
+	if _, err := b.sendDelivery(context.Background(), store.Job{ChatID: 7, MessageID: 10}, store.Delivery{Kind: "document", Text: "Текст лекции"}); err != nil {
+		t.Fatal(err)
+	}
 	if !called.Load() {
 		t.Fatal("document was not sent")
 	}

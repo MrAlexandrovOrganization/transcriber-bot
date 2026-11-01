@@ -1,0 +1,1 @@
+INSERT INTO bot_cursors(bot_id) VALUES($1) ON CONFLICT DO NOTHING;

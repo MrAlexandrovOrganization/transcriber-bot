@@ -18,3 +18,5 @@ location
 
 # Local image release manifests and activation state
 /.images/
+
+.build/

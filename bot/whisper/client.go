@@ -2,6 +2,7 @@ package whisper
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -24,6 +25,8 @@ const (
 
 // UnavailableError is returned when the Whisper service is unreachable.
 type UnavailableError struct{ cause error }
+
+func (e *UnavailableError) Unwrap() error { return e.cause }
 
 func (e *UnavailableError) Error() string {
 	return fmt.Sprintf("whisper service unavailable: %v", e.cause)
@@ -57,6 +60,7 @@ func NewClient(host, port string) (*Client, error) {
 	conn, err := grpc.NewClient(
 		fmt.Sprintf("%s:%s", host, port),
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(50*1024*1024)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("grpc dial: %w", err)
@@ -77,6 +81,17 @@ func (c *Client) Submit(r io.Reader, format string, options *pb.TranscriptionOpt
 
 // SubmitContext uploads audio while propagating the active W3C trace context.
 func (c *Client) SubmitContext(parent context.Context, r io.Reader, format string, options *pb.TranscriptionOptions) (jobID string, queuePosition int, err error) {
+	return c.submit(parent, r, format, options, "", false)
+}
+
+// SubmitDurable reuses an operation ID persisted before the first attempt.
+func (c *Client) SubmitDurable(parent context.Context, r io.Reader, format string, options *pb.TranscriptionOptions, requestID string) (string, int, error) {
+	if requestID == "" {
+		return "", 0, fmt.Errorf("durable request ID required")
+	}
+	return c.submit(parent, r, format, options, requestID, true)
+}
+func (c *Client) submit(parent context.Context, r io.Reader, format string, options *pb.TranscriptionOptions, requestID string, retain bool) (string, int, error) {
 	ctx, cancel := context.WithTimeout(outgoingContext(parent), uploadTimeout)
 	defer cancel()
 
@@ -85,7 +100,7 @@ func (c *Client) SubmitContext(parent context.Context, r io.Reader, format strin
 		return "", 0, c.wrapErr(err)
 	}
 
-	if err := c.sendChunks(stream, r, format, options); err != nil {
+	if err := c.sendChunksWithIdentity(stream, r, format, options, requestID, retain); err != nil && !errors.Is(err, io.EOF) {
 		return "", 0, err
 	}
 
@@ -145,6 +160,17 @@ func (c *Client) GetStatusContext(parent context.Context, jobID string) (*JobRes
 	}, nil
 }
 
+// Ack is safe only after the result/error and delivery context commit locally.
+func (c *Client) Ack(ctx context.Context, jobID string) error {
+	ctx, cancel := context.WithTimeout(outgoingContext(ctx), pollTimeout)
+	defer cancel()
+	_, err := c.stub.Ack(ctx, &pb.AckRequest{JobId: jobID})
+	if status.Code(err) == codes.NotFound {
+		return nil
+	} // Previous Ack may have succeeded before a crash.
+	return c.wrapErr(err)
+}
+
 func outgoingContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
@@ -162,6 +188,11 @@ func outgoingContext(ctx context.Context) context.Context {
 func (c *Client) sendChunks(stream interface {
 	Send(*pb.TranscribeChunk) error
 }, r io.Reader, format string, options *pb.TranscriptionOptions) error {
+	return c.sendChunksWithIdentity(stream, r, format, options, "", false)
+}
+func (c *Client) sendChunksWithIdentity(stream interface {
+	Send(*pb.TranscribeChunk) error
+}, r io.Reader, format string, options *pb.TranscriptionOptions, requestID string, retain bool) error {
 	buf := make([]byte, chunkSize)
 	first := true
 	for {
@@ -171,6 +202,8 @@ func (c *Client) sendChunks(stream interface {
 			if first {
 				chunk.Format = format
 				chunk.Options = options
+				chunk.RequestId = requestID
+				chunk.RetainUntilAck = retain
 				first = false
 			}
 			if sendErr := stream.Send(chunk); sendErr != nil {
@@ -178,6 +211,9 @@ func (c *Client) sendChunks(stream interface {
 			}
 		}
 		if err == io.EOF {
+			if first && requestID != "" {
+				return stream.Send(&pb.TranscribeChunk{Format: format, Options: options, RequestId: requestID, RetainUntilAck: retain})
+			}
 			break
 		}
 		if err != nil {
@@ -188,6 +224,9 @@ func (c *Client) sendChunks(stream interface {
 }
 
 func (c *Client) wrapErr(err error) error {
+	if err == nil {
+		return nil
+	}
 	st, _ := status.FromError(err)
 	if st.Code() == codes.Unavailable || st.Code() == codes.DeadlineExceeded {
 		return &UnavailableError{cause: err}
