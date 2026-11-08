@@ -34,6 +34,35 @@ Cancellation is persisted and replayed against the backend after restart. It
 requires the owner and the stored job's chat. A race with completion may deliver
 the already completed result rather than claim a successful cancellation.
 
+### Quiet groups
+
+Group/supergroup jobs persist `group_chat` from the Telegram chat type. Migration
+`0003_quiet_groups.sql` backfills this flag for existing negative group chat IDs
+and extends the delivery outbox with idempotent `delete` operations; existing
+jobs, results and delivery receipts are preserved.
+
+Before the initial group status, `GetAvailability` must succeed within three
+seconds and report an enabled worker. Otherwise the job becomes locally terminal
+without a Telegram message, download or backend upload. It does not resume when
+workers return; the user must send that recording again. Busy workers still
+accept queueing. Availability requires a report within 45 seconds and, in
+RabbitMQ mode, valid consumer admission. It is advisory, not a reservation.
+
+If all workers disappear while a submitted group job is queued/running, or
+status RPCs fail, cancellation is persisted before deleting the status. Backend cancellation,
+terminal result storage and Ack retry after recovery, preventing abandoned
+retained backend results. A group cancellation also hides the status if the
+backend is temporarily unreachable. Group terminal errors use a durable delete
+delivery instead of an error message; this also applies to old persisted error
+delivery plans. Missing/already deleted messages count as successful deletion.
+Other deletion failures retry without posting a replacement. Telegram deletion
+permissions and the [48-hour API limit](https://core.telegram.org/bots/api#deletemessage) still apply.
+
+Successful group results are unchanged. A persisted group cancellation suppresses
+delivery even if completion raced with it. Private chats retain their original
+queue/error/confirmation behavior. Short RPC deadlines are three seconds and
+polling uses two seconds; upload and inference deadlines are not shortened.
+
 ## Guarantees and limitations
 
 - Session advisory locks serialize each job's network stage across processes;
@@ -87,9 +116,10 @@ PostgreSQL. There is no durable old job/chat mapping to import. Restart recovery
 covers updates accepted by this version; it cannot recover mappings already lost
 by an older process. Do not run a second poller as a migration method.
 
-The backend must support request_id, retention and Ack before enabling this bot.
-A10 backend revision e60cba0 already does. Canonical protocol source/revision/hash
-are pinned in `proto/source.json`; `make proto-sync` is an explicit authenticated
+The backend must support request_id, retention, Ack and GetAvailability before
+enabling this bot. Revision `57eab2b` adds availability; the earlier `e60cba0`
+already supports durable delivery. Canonical protocol source/revision/hash are
+pinned in `proto/source.json`; `make proto-sync` is an explicit authenticated
 GitHub CLI operation. `make proto-gen` generates offline from the snapshot.
 `make proto-check` verifies its hash, formatting, build and lint. Generation in
 Docker uses the same pinned tools and Make target. No backend checkout is needed.

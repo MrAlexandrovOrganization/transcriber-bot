@@ -113,6 +113,7 @@ func (p *Poller) Accept(ctx context.Context, updates []Update, nextOffset int) e
 
 type Job struct {
 	Ready                                          bool
+	GroupChat                                      bool
 	BotID, UpdateID, ChatID, UserID                int64
 	MessageID                                      int
 	FileID, Format, Preset, Noun, RequestID, JobID string
@@ -159,7 +160,7 @@ func (s *Store) ProcessInbox(ctx context.Context, botID int64, accept func(int, 
 	}
 	defer tx.Rollback(ctx)
 	if job != nil {
-		_, err = tx.Exec(ctx, query("job_insert"), botID, id, job.ChatID, job.UserID, job.MessageID, job.FileID, job.Format, job.Preset, job.Noun, fmt.Sprintf("transcriber-bot:%d:%d", botID, id))
+		_, err = tx.Exec(ctx, query("job_insert"), botID, id, job.ChatID, job.UserID, job.MessageID, job.FileID, job.Format, job.Preset, job.Noun, fmt.Sprintf("transcriber-bot:%d:%d", botID, id), job.GroupChat)
 		if err != nil {
 			return true, err
 		}
@@ -190,7 +191,7 @@ type Work struct {
 
 func readJob(ctx context.Context, conn *pgxpool.Conn, botID, id int64) (Job, error) {
 	var j Job
-	err := conn.QueryRow(ctx, query("job_read"), botID, id).Scan(&j.BotID, &j.UpdateID, &j.ChatID, &j.UserID, &j.MessageID, &j.FileID, &j.Format, &j.Preset, &j.Noun, &j.RequestID, &j.JobID, &j.StatusMessageID, &j.State, &j.Result, &j.Acknowledged, &j.CancelRequested, &j.ProgressText, &j.Attempts, &j.NextAttempt, &j.Ready)
+	err := conn.QueryRow(ctx, query("job_read"), botID, id).Scan(&j.BotID, &j.UpdateID, &j.ChatID, &j.UserID, &j.MessageID, &j.FileID, &j.Format, &j.Preset, &j.Noun, &j.RequestID, &j.JobID, &j.StatusMessageID, &j.State, &j.Result, &j.Acknowledged, &j.CancelRequested, &j.ProgressText, &j.Attempts, &j.NextAttempt, &j.Ready, &j.GroupChat)
 	return j, err
 }
 
@@ -253,8 +254,9 @@ func (w *Work) Schedule(ctx context.Context, delay time.Duration, code string) e
 func (w *Work) Progress(ctx context.Context, text string) error {
 	return w.exec(ctx, "job_progress", text)
 }
-func (w *Work) Acknowledged(ctx context.Context) error { return w.exec(ctx, "job_ack") }
-func (w *Work) Complete(ctx context.Context) error     { return w.exec(ctx, "job_done") }
+func (w *Work) Acknowledged(ctx context.Context) error  { return w.exec(ctx, "job_ack") }
+func (w *Work) RequestCancel(ctx context.Context) error { return w.exec(ctx, "job_cancel_work") }
+func (w *Work) Complete(ctx context.Context) error      { return w.exec(ctx, "job_done") }
 func (w *Work) Result(ctx context.Context, result json.RawMessage, parts []Delivery) error {
 	if len(parts) == 0 || len(result) == 0 {
 		return errors.New("terminal result requires a durable delivery plan")

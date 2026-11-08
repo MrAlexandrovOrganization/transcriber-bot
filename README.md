@@ -60,6 +60,20 @@ Status messages and uploads keep FIFO order within each chat. At most two
 uploads run across all chats. Later completed jobs are delivered immediately,
 without waiting for earlier transcriptions.
 
+Groups and supergroups are quiet when transcription is unavailable. Before
+sending a status message or downloading media, the bot checks enabled workers
+with a three-second RPC deadline. If none are available (or the backend cannot
+be reached), it permanently skips that recording without replying. A busy
+worker counts as available, so normal queues still work. Worker reports expire
+for this preflight after 45 seconds; the check cannot predict a later outage.
+If workers disappear while a group job is queued or running, the bot hides its
+status and persists cancellation. Group failures and cancellations delete the bot's status
+instead of leaving an error/confirmation; successful transcripts are delivered
+normally. Private chats retain durable queuing and their error/cancel replies.
+Status/cancel RPC deadlines are three seconds; status polling is every two
+seconds. Media upload and long inference keep their independent time budgets.
+See [durable processing](docs/durable-jobs.md) for restart and rollout details.
+
 Pending admission, uploads, status polling, cancellation, backend Ack and every
 result delivery part resume after restart. Results and their delivery outbox
 commit locally **before backend Ack**. Confirmed Telegram parts are not resent.

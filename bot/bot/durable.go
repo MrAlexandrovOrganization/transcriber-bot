@@ -204,7 +204,7 @@ func (b *Bot) acceptUpdate(ctx context.Context, u telego.Update) (*store.Job, er
 	if fileID == "" {
 		return nil, nil
 	}
-	return &store.Job{ChatID: msg.Chat.ID, UserID: msg.From.ID, MessageID: msg.MessageID, FileID: fileID, Format: format, Preset: resolvePreset(preset, msg), Noun: mediaNoun(msg)}, nil
+	return &store.Job{ChatID: msg.Chat.ID, GroupChat: isGroupChat(msg.Chat), UserID: msg.From.ID, MessageID: msg.MessageID, FileID: fileID, Format: format, Preset: resolvePreset(preset, msg), Noun: mediaNoun(msg)}, nil
 }
 
 func (b *Bot) workLoop(ctx context.Context, state string) {
@@ -249,6 +249,17 @@ func (b *Bot) step(ctx context.Context, w *store.Work) error {
 	j := w.Job
 	switch j.State {
 	case "status":
+		if j.GroupChat {
+			available, err := b.client.Available(ctx)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil || !available {
+				// Finish locally before any Telegram message or media upload.
+				slog.InfoContext(ctx, "group transcription skipped", "reason", "workers_unavailable", "update_id", j.UpdateID)
+				return b.saveResult(ctx, w, &whisper.JobResult{Status: pb.JobStatus_FAILED, Error: "workers_unavailable"})
+			}
+		}
 		message, err := b.sendInitialStatus(ctx, sourceMessage(j), j.Noun)
 		if err != nil {
 			return err
@@ -274,7 +285,14 @@ func (b *Bot) step(ctx context.Context, w *store.Work) error {
 		return w.Submitted(ctx, id)
 	case "poll":
 		if j.CancelRequested {
-			if _, err := b.client.CancelContext(ctx, j.JobID); err != nil {
+			_, err := b.client.CancelContext(ctx, j.JobID)
+			if j.GroupChat {
+				deleteErr := b.deleteStatus(ctx, j)
+				if err == nil {
+					err = deleteErr
+				}
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -283,10 +301,25 @@ func (b *Bot) step(ctx context.Context, w *store.Work) error {
 			return b.saveResult(ctx, w, &whisper.JobResult{Status: pb.JobStatus_FAILED, Error: "job_missing"})
 		}
 		if err != nil {
+			if j.GroupChat && ctx.Err() == nil {
+				return b.cancelGroupJob(ctx, w)
+			}
 			return err
 		}
 		if result.Status == pb.JobStatus_DONE || result.Status == pb.JobStatus_FAILED {
 			return b.saveResult(ctx, w, result)
+		}
+		if j.GroupChat && !j.CancelRequested && (result.Status == pb.JobStatus_QUEUED || result.Status == pb.JobStatus_RUNNING) {
+			available, err := b.client.Available(ctx)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if err != nil || !available {
+				return b.cancelGroupJob(ctx, w)
+			}
+		}
+		if j.GroupChat && j.CancelRequested {
+			return w.Schedule(ctx, pollInterval, "")
 		}
 		text := resources.Queued
 		if result.Status == pb.JobStatus_RUNNING {
@@ -298,7 +331,10 @@ func (b *Bot) step(ctx context.Context, w *store.Work) error {
 		if text != j.ProgressText {
 			params := editParams(j.ChatID, j.StatusMessageID, tgfmt.Escape(text))
 			params.ReplyMarkup = cancelKeyboard(j.JobID)
-			if _, err = b.api.EditMessageText(ctx, params); err == nil || isMessageNotModifiedError(err) {
+			editCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			_, err = b.api.EditMessageText(editCtx, params)
+			cancel()
+			if err == nil || isMessageNotModifiedError(err) {
 				if err = w.Progress(ctx, text); err != nil {
 					return err
 				}
@@ -312,6 +348,9 @@ func (b *Bot) step(ctx context.Context, w *store.Work) error {
 	}
 }
 func resultParts(j store.Job, result *whisper.JobResult) []store.Delivery {
+	if j.GroupChat && (result.Status == pb.JobStatus_FAILED || j.CancelRequested) {
+		return []store.Delivery{{Kind: "delete"}}
+	}
 	if result.Status == pb.JobStatus_FAILED {
 		text := resources.TranscriptionFailed
 		switch result.Error {
@@ -378,12 +417,24 @@ func (b *Bot) deliver(ctx context.Context, w *store.Work) error {
 	return w.Complete(ctx)
 }
 func (b *Bot) sendDelivery(ctx context.Context, j store.Job, d store.Delivery) (int, error) {
+	// Honor the group policy for delivery plans persisted by older releases too.
+	if j.GroupChat && len(j.Result) > 0 {
+		var result whisper.JobResult
+		if err := json.Unmarshal(j.Result, &result); err != nil {
+			return 0, err
+		}
+		if result.Status == pb.JobStatus_FAILED || j.CancelRequested {
+			d.Kind = "delete"
+		}
+	}
 	html := tgfmt.Escape(d.Text)
 	if d.Quoted {
 		html = quoteText(d.Text)
 	}
 	reply := &telego.ReplyParameters{MessageID: j.MessageID, ChatID: tu.ID(j.ChatID), AllowSendingWithoutReply: true}
 	switch d.Kind {
+	case "delete":
+		return j.StatusMessageID, b.deleteStatus(ctx, j)
 	case "edit":
 		_, err := b.api.EditMessageText(ctx, editParams(j.ChatID, j.StatusMessageID, html))
 		if err == nil || isMessageNotModifiedError(err) {
@@ -411,6 +462,34 @@ func (b *Bot) sendDelivery(ctx context.Context, j store.Job, d store.Delivery) (
 	default:
 		return 0, errors.New("unknown delivery kind")
 	}
+}
+
+// Persist cancellation before hiding the status. Backend cancellation and Ack
+// still recover after a restart/outage, without recreating a group message.
+func (b *Bot) cancelGroupJob(ctx context.Context, w *store.Work) error {
+	if err := w.RequestCancel(ctx); err != nil {
+		return err
+	}
+	if err := b.deleteStatus(ctx, w.Job); err != nil {
+		return err
+	}
+	return w.Schedule(ctx, pollInterval, "")
+}
+
+func (b *Bot) deleteStatus(parent context.Context, j store.Job) error {
+	if j.StatusMessageID == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
+	defer cancel()
+	err := b.api.DeleteMessage(ctx, &telego.DeleteMessageParams{ChatID: tu.ID(j.ChatID), MessageID: j.StatusMessageID})
+	if err != nil {
+		text := strings.ToLower(err.Error())
+		if strings.Contains(text, "message to delete not found") || strings.Contains(text, "message_id_invalid") {
+			return nil
+		}
+	}
+	return err
 }
 func isMissingMessage(err error) bool {
 	if err == nil {

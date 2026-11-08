@@ -20,7 +20,7 @@ import (
 const (
 	chunkSize     = 1 * 1024 * 1024 // 1 MB per chunk
 	uploadTimeout = 120 * time.Second
-	pollTimeout   = 10 * time.Second
+	pollTimeout   = 3 * time.Second
 )
 
 // UnavailableError is returned when the Whisper service is unreachable.
@@ -70,6 +70,17 @@ func NewClient(host, port string) (*Client, error) {
 
 func (c *Client) Close() error {
 	return c.conn.Close()
+}
+
+// Available checks loaded, enabled workers; a busy pool is still available.
+func (c *Client) Available(parent context.Context) (bool, error) {
+	ctx, cancel := context.WithTimeout(outgoingContext(parent), pollTimeout)
+	defer cancel()
+	resp, err := c.stub.GetAvailability(ctx, &pb.AvailabilityRequest{})
+	if err != nil {
+		return false, c.wrapErr(err)
+	}
+	return resp.Available, nil
 }
 
 // Submit uploads audio and returns a job ID immediately.

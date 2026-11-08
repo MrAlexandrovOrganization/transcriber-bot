@@ -37,6 +37,14 @@ type durableBackend struct {
 	accepted, acks, cancels          int
 	loseSubmit, loseAck, earlyReplay bool
 	beforeAck                        func()
+	unavailable                      bool
+	availabilityErr, statusErr       error
+}
+
+func (s *durableBackend) GetAvailability(context.Context, *pb.AvailabilityRequest) (*pb.AvailabilityResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &pb.AvailabilityResponse{Available: !s.unavailable}, s.availabilityErr
 }
 
 func (s *durableBackend) Submit(stream grpc.ClientStreamingServer[pb.TranscribeChunk, pb.SubmitResponse]) error {
@@ -84,6 +92,9 @@ func (s *durableBackend) Submit(stream grpc.ClientStreamingServer[pb.TranscribeC
 func (s *durableBackend) GetStatus(_ context.Context, r *pb.StatusRequest) (*pb.StatusResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.statusErr != nil {
+		return nil, s.statusErr
+	}
 	v := s.jobs[r.JobId]
 	if v == nil {
 		return nil, status.Error(codes.NotFound, "synthetic missing job")
@@ -216,6 +227,7 @@ type telegramFixture struct {
 	requests                                           []fakeDelivery
 	nextID                                             int
 	failSend, failDocument, notModified, deletedStatus bool
+	failDelete, missingDelete                          bool
 }
 
 func (f *telegramFixture) handler(t *testing.T) http.HandlerFunc {
@@ -250,6 +262,17 @@ func (f *telegramFixture) handler(t *testing.T) http.HandlerFunc {
 		text, _ := body["text"].(string)
 		message, _ := body["message_id"].(float64)
 		f.requests = append(f.requests, fakeDelivery{method, text, int(message)})
+		if method == "deleteMessage" {
+			if f.failDelete {
+				f.failDelete = false
+				fmt.Fprint(w, `{"ok":false,"error_code":503,"description":"synthetic delete failure"}`)
+			} else if f.missingDelete {
+				fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message to delete not found"}`)
+			} else {
+				fmt.Fprint(w, `{"ok":true,"result":true}`)
+			}
+			return
+		}
 		if method == "editMessageText" && f.notModified {
 			f.notModified = false
 			fmt.Fprint(w, `{"ok":false,"error_code":400,"description":"Bad Request: message is not modified"}`)

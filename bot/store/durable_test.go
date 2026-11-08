@@ -84,6 +84,13 @@ func TestCursorAtomicityAndPollerOwnership(t *testing.T) {
 	}
 	p.Close()
 	restarted, err := s.OpenPoller(ctx, testBotID)
+	// TCP close can return before PostgreSQL releases the old session lock.
+	// Runtime likewise waits for previous ownership rather than losing updates.
+	deadline := time.Now().Add(time.Second)
+	for errors.Is(err, ErrPollerOwned) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		restarted, err = s.OpenPoller(ctx, testBotID)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +302,7 @@ func TestMigrationPreservesLegacyChatsAndIsRepeatable(t *testing.T) {
 		t.Fatal("legacy access lost", err)
 	}
 	var count int
-	if err = conn.QueryRow(ctx, "SELECT COUNT(*) FROM bot_schema_migrations").Scan(&count); err != nil || count != 2 {
+	if err = conn.QueryRow(ctx, "SELECT COUNT(*) FROM bot_schema_migrations").Scan(&count); err != nil || count != 3 {
 		t.Fatal(count, err)
 	}
 }
@@ -342,11 +349,61 @@ func TestSlowDDLHasSeparateBoundedMigrationBudget(t *testing.T) {
 		t.Fatalf("slow startup DDL incorrectly used ordinary query timeout: %v", err)
 	}
 	var count int
-	if err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM bot_schema_migrations").Scan(&count); err != nil || count != 2 {
+	if err = pool.QueryRow(ctx, "SELECT COUNT(*) FROM bot_schema_migrations").Scan(&count); err != nil || count != 3 {
 		t.Fatal("migration did not commit", count, err)
 	}
 	var timeout string
 	if err = pool.QueryRow(ctx, "SHOW statement_timeout").Scan(&timeout); err != nil || timeout != "5s" {
 		t.Fatal("migration timeout leaked to ordinary queries", timeout, err)
+	}
+}
+
+func TestQuietGroupMigrationPreservesJobsAndDeliveryReceipts(t *testing.T) {
+	dsn := testdb.New(t)
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+	if _, err = conn.Exec(ctx, query("migrate_init")); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"0001_chats.sql", "0002_durable_jobs.sql"} {
+		data, err := statements.ReadFile("sql/migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = conn.Exec(ctx, string(data)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = conn.Exec(ctx, query("migrate_record"), name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = conn.Exec(ctx, `INSERT INTO transcription_jobs(bot_id,update_id,chat_id,user_id,message_id,file_id,format,preset,noun,request_id,state)
+ VALUES(1,1,-7,7,1,'synthetic','ogg','voice','voice','synthetic:group','deliver'),
+ (1,2,7,7,2,'synthetic','ogg','voice','voice','synthetic:private','poll');
+ INSERT INTO transcription_deliveries(bot_id,update_id,part,kind,text,message_id,delivered) VALUES(1,1,0,'edit','synthetic result',42,true);`); err != nil {
+		t.Fatal(err)
+	}
+	s := openStore(t, dsn)
+	s.Close()
+	var groupChat, privateChat, delivered bool
+	var receipt int
+	if err = conn.QueryRow(ctx, "SELECT group_chat FROM transcription_jobs WHERE update_id=1").Scan(&groupChat); err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.QueryRow(ctx, "SELECT group_chat FROM transcription_jobs WHERE update_id=2").Scan(&privateChat); err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.QueryRow(ctx, "SELECT message_id,delivered FROM transcription_deliveries").Scan(&receipt, &delivered); err != nil {
+		t.Fatal(err)
+	}
+	if !groupChat || privateChat || !delivered || receipt != 42 {
+		t.Fatal("migration lost chat policy or receipt")
+	}
+	if _, err = conn.Exec(ctx, "INSERT INTO transcription_deliveries(bot_id,update_id,part,kind,text) VALUES(1,1,1,'delete','')"); err != nil {
+		t.Fatal(err)
 	}
 }

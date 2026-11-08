@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	pollInterval         = 5 * time.Second
+	pollInterval         = 2 * time.Second
 	maxMsgRunes          = 4096 - 128 // Telegram message length limit
 	downloadTimeout      = 30 * time.Minute
 	maxDownloadErrorBody = 4 * 1024
@@ -284,6 +284,8 @@ func mediaNoun(msg *telego.Message) string {
 }
 
 func (b *Bot) sendInitialStatus(ctx context.Context, msg *telego.Message, noun string) (*telego.Message, error) {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	m := messageParams(msg.Chat.ID, tgfmt.Escape(fmt.Sprintf(resources.QueuedMedia, noun)))
 	m.ReplyParameters = &telego.ReplyParameters{MessageID: msg.MessageID, ChatID: tu.ID(msg.Chat.ID), AllowSendingWithoutReply: true}
 

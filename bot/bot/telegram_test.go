@@ -208,3 +208,18 @@ func TestMessageCommand(t *testing.T) {
 		t.Errorf("text without command entity = %q", got)
 	}
 }
+
+func TestOldGroupErrorDeliveryDeletesInsteadOfPosting(t *testing.T) {
+	var methods []string
+	b, _ := fakeTelegram(t, func(w http.ResponseWriter, r *http.Request) {
+		methods = append(methods, strings.TrimPrefix(r.URL.Path, "/bot"+testToken+"/"))
+		fmt.Fprint(w, `{"ok":true,"result":true}`)
+	})
+	job := store.Job{GroupChat: true, ChatID: -7, StatusMessageID: 42, Result: json.RawMessage(`{"Status":5,"Error":"cancelled"}`)}
+	if _, err := b.sendDelivery(context.Background(), job, store.Delivery{Kind: "edit", Text: "old cancellation confirmation"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(methods) != 1 || methods[0] != "deleteMessage" {
+		t.Fatal("legacy error was posted", methods)
+	}
+}

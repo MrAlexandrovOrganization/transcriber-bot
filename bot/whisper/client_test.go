@@ -7,6 +7,7 @@ import (
 	"google.golang.org/grpc"
 	"net"
 	"testing"
+	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -189,5 +190,50 @@ func TestDurableSubmitAcceptsEarlyReplayResponse(t *testing.T) {
 	id, _, err := client.SubmitDurable(context.Background(), bytes.NewReader(make([]byte, 8*chunkSize)), "ogg", nil, "transcriber-bot:synthetic-replay")
 	if err != nil || id != "persisted-job" {
 		t.Fatalf("early replay response lost: id=%q err=%v", id, err)
+	}
+}
+
+type availabilityBackend struct {
+	pb.UnimplementedTranscriptionServiceServer
+	deadlines chan time.Duration
+}
+
+func (s availabilityBackend) GetAvailability(ctx context.Context, _ *pb.AvailabilityRequest) (*pb.AvailabilityResponse, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, status.Error(codes.InvalidArgument, "missing deadline")
+	}
+	s.deadlines <- time.Until(deadline)
+	return &pb.AvailabilityResponse{Available: true}, nil
+}
+func TestAvailabilityHasShortDeadlineAndHonorsParent(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := grpc.NewServer()
+	deadlines := make(chan time.Duration, 2)
+	pb.RegisterTranscriptionServiceServer(server, availabilityBackend{deadlines: deadlines})
+	go server.Serve(listener)
+	defer server.Stop()
+	host, port, _ := net.SplitHostPort(listener.Addr().String())
+	client, err := NewClient(host, port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if available, err := client.Available(context.Background()); err != nil || !available {
+		t.Fatal(available, err)
+	}
+	if remaining := <-deadlines; remaining <= 0 || remaining > 3*time.Second {
+		t.Fatal("unbounded availability RPC", remaining)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if available, err := client.Available(ctx); err != nil || !available {
+		t.Fatal(available, err)
+	}
+	if remaining := <-deadlines; remaining <= 0 || remaining > time.Second {
+		t.Fatal("parent deadline ignored", remaining)
 	}
 }
