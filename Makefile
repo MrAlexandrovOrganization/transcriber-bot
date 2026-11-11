@@ -151,3 +151,5 @@ test-db-down:
 	@if [ "$$(docker inspect --format '{{ index .Config.Labels "purpose" }}' transcriber-bot-ci-test-db 2>/dev/null)" = transcriber-bot-ci-test-db ]; then \
 		docker stop transcriber-bot-ci-test-db; \
 	fi
+
+include makefiles/observability.mk

@@ -291,3 +291,22 @@ second polling bot. Before switching back after new writes, stop Russia and move
 its latest database back. Migration backups are private under
 `/home/maxim/backups/transcriber-migration-20261019` on both hosts and the
 operator's `~/.local/state/transcriber-migration-20261019`.
+
+## Настройки наблюдаемости
+
+`monitoring/observability.json` описывает только компоненты и ресурсы этого
+проекта: правила разбора логов, targets метрик и дашборды. Стандартные JSON/logfmt
+логи и метрики контейнеров собираются общими средствами; пустой список ресурсов
+не отключает общий сбор.
+
+`make observability-check` проверяет пакет без сети, Docker и соседних checkout
+(Python 3.9+). `make observability-export` создаёт `.observability/package.tar`;
+CI публикует его как artifact. Экспорт содержит явно перечисленные файлы,
+ревизию и SHA-256. Незакоммиченные ресурсы помечаются `source_state=worktree`.
+Приватные `.env`, credentials и карта инфраструктуры в экспорт не входят.
+
+В ресурсах задаётся логическое размещение `local` (сбор метрик рядом с сервисом)
+или `central` (центральные провайдеры). Физическое размещение и набор других
+пакетов задаются закрытой конфигурацией доставки. Сборщик строит итоговый файл
+из закреплённых экспортов; обычная сборка этого проекта не зависит от них.
+Копия Python-инструмента закреплена SHA-256 в `monitoring/tool.lock.json`.

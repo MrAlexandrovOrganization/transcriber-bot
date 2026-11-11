@@ -20,3 +20,5 @@ location
 /.images/
 
 .build/
+
+.observability/

@@ -18,3 +18,5 @@ bot/gen
 **/*_test.go
 **/__pycache__
 .DS_Store
+
+.observability/

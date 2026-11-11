@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "service": "transcriber-bot",
+  "components": [
+    "transcriber-bot/*"
+  ],
+  "logs": [],
+  "assets": []
+}
